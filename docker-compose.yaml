@@ -1,0 +1,27 @@
+services:
+  remuxkit:
+    image: ghcr.io/chen8945/bluray-remuxkit:latest
+    container_name: bluray-remuxkit
+    network_mode: none
+    init: true
+    stdin_open: true
+    tty: true
+    user: 0:0
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/loop-control:/dev/loop-control
+      - /dev/loop0:/dev/loop0
+      - /dev/loop1:/dev/loop1
+      - /dev/loop2:/dev/loop2
+      - /dev/loop3:/dev/loop3
+      - /dev/loop4:/dev/loop4
+      - /dev/loop5:/dev/loop5
+    volumes:
+      - ./input:/input:ro
+      - ./output:/output
+    tmpfs:
+      - /tmp:exec

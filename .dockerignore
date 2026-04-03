@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.tar.xz
+test_*.py
+docker-compose.yaml
+input/
+output/
+bdinfo/
