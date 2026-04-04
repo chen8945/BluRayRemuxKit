@@ -2,60 +2,20 @@
 """
 Blu-ray Remux Script
 --------------------
-自动化将蓝光原盘（BDMV）或 ISO 镜像批量 Remux 为 MKV，支持智能正片识别、BDInfo 深度解析与重构、以及交互式轨道编辑。
+批量将蓝光原盘（BDMV）或 ISO Remux 为 MKV。
 
-核心特性：
-- 智能正片识别：解析底层 MPLS 文件，综合对比时长、章节与文件大小，精准提取并去重章节标记。
-- 次世代音频提取：精准识别 TrueHD Atmos 与 DTS:X，自动提取 TrueHD 净码率并智能剥离 AC3 核心轨。
-- 极客级命名与规范化：
-  * 音轨：自动提取 BDInfo 中的「央视国语」「粤配」「导评」等自定义描述。
-  * 字幕：智能判定并补全「简英双语特效」，自动统一「黑边/画内」等排版位置标签。
-- 强迫症级轨道排序：
-  * 音频：按 编码(Atmos/DTS:X优先) > 地区权重(央视>六区) > 语言 > 码率 排序。
-  * 字幕：按 位置(黑边>画内) > 类型(双语>单语) > 地区 > 语言 > 轨道名称拼音 排序。
-- 高效批处理支持：支持范围语法快捷编辑（如 d S1-S5），跨平台自动挂载/卸载 ISO（Win/Mac/Linux）。
+主要能力：
+- 自动识别正片、章节、音轨和字幕
+- 整合 BDInfo 信息并支持交互式轨道编辑
+- 支持批量处理和跨平台 ISO 挂载
 
-参数说明：
-  -i, --input          [必选] 包含蓝光原盘（文件夹）或 ISO 文件的根目录，支持递归扫描多层子目录。
-  -o, --output         [可选] 输出 MKV 文件的保存目录（默认值：./output）。
-  --bdinfo-dir         [可选] 外部 BDInfo 文本的统一存放目录。
-  --skip-interactive   [可选] 开启全自动静默模式，跳过所有手动确认和轨道编辑环节。
-  --continue-on-error  [可选] 容错模式，当某个原盘处理报错或损坏时，自动跳过并继续处理下一个。
-  --commentary         [可选] 导评轨道处理策略 [keep | drop | ask]。
-                              - keep: 全局正常保留（默认）
-                              - drop: 全局强制剔除导评
-                              - ask: 每个原盘处理前单独询问
-  --best-audio         [可选] 最高规格音轨精简策略 [no | yes | ask]。
-                              - no: 全局按脚本默认规则保留音轨（默认）
-                              - yes: 全局每种语言仅保留一条最高规格音轨
-                              - ask: 每个原盘处理前单独询问
-  --simplify-subs      [可选] 外语字幕精简策略 [yes | no | ask]。
-                              - yes: 英语和原语言字幕仅保留排序第一的最优轨，中文全保留（默认）
-                              - no: 全局保留所有支持的外语字幕
-                              - ask: 每个原盘处理前单独询问
+详细参数、使用示例和 BDInfo 输入方式请见 README.md。
 
-使用示例：
-1. 基础批量处理（带交互式轨道确认）：
-   python bluray_remux.py -i /path/to/BluRays -o /output
-
-2. 全自动静默处理（跳过交互式确认，使用默认排序逻辑）：
-   python bluray_remux.py -i /path/to/BluRays -o /output --skip-interactive
-
-3. 极致精简模式（全自动处理 + 丢弃导评 + 仅留最高规格音轨 + 精简外语字幕）：
-   python bluray_remux.py -i /path/to/BluRays -o /output --skip-interactive --commentary drop --best-audio yes --simplify-subs yes
-
-4. 指定外部 BDInfo 目录（当原盘旁无同名 txt 时提取）：
-   python bluray_remux.py -i /path/to/BluRays --bdinfo-dir /path/to/bdinfos -o /output
-
-BDInfo 匹配规则（按优先级）：
-1. 同名优先：在原盘同目录下查找 {原盘名}.txt 或 {原盘名}_bdinfo.txt
-2. 向上回溯：从原盘所在目录开始，向上最多回溯 3 层查找 bdinfo.txt
-3. 统一目录：在 --bdinfo-dir 参数指定的目录下查找同名 txt
-
-依赖要求：
+依赖：
 - mkvmerge (MKVToolNix)
 - ffprobe (FFmpeg)
 - Python 包：rich, pycountry
+- 可选增强输入：prompt_toolkit
 """
 import os
 import re
@@ -64,20 +24,31 @@ import json
 import time
 import copy
 import shutil
+import tempfile
 import subprocess
 import argparse
+import shlex
 import mimetypes
 import unicodedata
 import pycountry
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
-from typing import List, Dict, Literal, Optional, Tuple
+from typing import Callable, List, Dict, Literal, Optional, Tuple
 from struct import unpack
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.prompt import Confirm, Prompt
+
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.history import InMemoryHistory
+except ImportError:
+    PromptSession = None
+    AutoSuggestFromHistory = None
+    InMemoryHistory = None
 
 # ==============================================================================
 # 全局配置
@@ -85,13 +56,13 @@ from rich.prompt import Confirm, Prompt
 
 # 调试模式（设置为 True 启用调试输出）
 DEBUG = False
+_PROMPT_SESSION = None
 
 # fmt: off
 # 工具路径配置（优先级：自定义路径 > 脚本目录 > 系统 PATH）
 CUSTOM_PATHS = {
     "mkvmerge": "",
     "ffprobe": "",
-    "mediainfo": ""
 }
 
 # 音轨编码权重（用于轨道排序）
@@ -119,31 +90,30 @@ LANGUAGE_VARIANTS = {
     }
 }
 
-# 中文显示名称映射（仅保留 pycountry 不支持的特殊情况）
-LANGUAGE_NAMES = {
-    # 中文变体（自定义标签）
+# 语言显示/字幕简称元数据（统一维护，别名交由 pycountry 归一）
+LANGUAGE_LABELS = {
+    "en": {"display_name": "英语", "subtitle_short": "英"},
+    "ja": {"display_name": "日语", "subtitle_short": "日"},
+    "ko": {"display_name": "韩语", "subtitle_short": "韩"},
+    "fr": {"display_name": "法语", "subtitle_short": "法"},
+    "de": {"display_name": "德语", "subtitle_short": "德"},
+    "es": {"display_name": "西班牙语", "subtitle_short": "西"},
+    "it": {"display_name": "意大利语", "subtitle_short": "意"},
+    "ru": {"display_name": "俄语", "subtitle_short": "俄"},
+    "pt": {"display_name": "葡萄牙语", "subtitle_short": "葡"},
+    "th": {"display_name": "泰语"},
+    "hu": {"display_name": "匈牙利语"},
+    "pl": {"display_name": "波兰语"},
+    "tr": {"display_name": "土耳其语"},
+}
+
+# pycountry 不支持或不适合直接显示的特殊名称
+SPECIAL_LANGUAGE_NAMES = {
     "zh-Hans": "简体中文",
     "zh-Hant": "繁体中文",
     "zho": "国语",  # 通用中文（未区分简繁）
     "chi": "国语",  # 通用中文（未区分简繁）
-
-    # 常见语言的中文名称（优化 UI 显示）
-    "eng": "英语", "en": "英语",
-    "jpn": "日语", "ja": "日语",
-    "kor": "韩语", "ko": "韩语",
-    "fra": "法语", "fre": "法语", "fr": "法语",
-    "deu": "德语", "ger": "德语", "de": "德语",
-    "spa": "西班牙语", "es": "西班牙语",
-    "ita": "意大利语", "it": "意大利语",
-    "rus": "俄语", "ru": "俄语",
-    "por": "葡萄牙语", "pt": "葡萄牙语",
-    "tha": "泰语", "th": "泰语",
-    "hun": "匈牙利语", "hu": "匈牙利语",
-    "pol": "波兰语", "pl": "波兰语",
-    "tur": "土耳其语", "tr": "土耳其语",
-
-    # 未知语言
-    "und": "未知"
+    "und": "未知",
 }
 
 # 中文轨道描述关键词配置（音频+字幕通用）
@@ -158,18 +128,6 @@ TRACK_KEYWORDS = {
     "commentary": ["导评", "评论", "commentary"]      # 导评标识
 }
 
-# 双语字幕语言简称（用于 optimize_subtitle_desc）
-SUBTITLE_LANG_SHORT = {
-    "英": "英", "英文": "英",
-    "日": "日", "日文": "日",
-    "法": "法", "法文": "法",
-    "德": "德", "德文": "德",
-    "韩": "韩", "韩文": "韩",
-    "西": "西", "西文": "西",
-    "俄": "俄", "俄文": "俄",
-    "意": "意", "意文": "意",
-    "葡": "葡", "葡文": "葡"
-}
 # fmt: on
 
 # 非法文件名字符替换（Windows 兼容）
@@ -184,11 +142,34 @@ SUBTITLE_LANGUAGES_PATTERN = r"(English|Japanese|Chinese|Korean|French|German|Sp
 BITRATE_KBPS_PATTERN = r"([\d,]+\.?\d*)\s*kbps?"  # 支持小数（如字幕码率：26.685 kbps），容错 kbp/kbps
 BITRATE_MBPS_PATTERN = r"([\d.]+)\s*Mbps"
 SDH_PATTERN = re.compile(r"(?i)\s*\(?(SDH|CC|听障|聋哑)\)?")
+BDINFO_PASTE_SENTINEL = "EOF"
 
 
 # ==============================================================================
 # 语言代码转换函数（基于 pycountry）
 # ==============================================================================
+
+
+def _build_subtitle_text_markers() -> List[Tuple[str, str]]:
+    """根据统一语言元数据生成字幕文本识别关键字。"""
+    markers = []
+    for meta in LANGUAGE_LABELS.values():
+        short = meta.get("subtitle_short")
+        if not short:
+            continue
+        markers.append((f"{short}文", short))
+        markers.append((short, short))
+    return markers
+
+
+def _build_subtitle_shorts() -> List[str]:
+    """根据统一语言元数据生成可复用的字幕简称列表。"""
+    shorts = {meta["subtitle_short"] for meta in LANGUAGE_LABELS.values() if meta.get("subtitle_short")}
+    return sorted(shorts, key=len, reverse=True)
+
+
+SUBTITLE_TEXT_MARKERS = _build_subtitle_text_markers()
+SUBTITLE_SHORTS = _build_subtitle_shorts()
 
 
 @lru_cache(maxsize=256)
@@ -463,9 +444,10 @@ def get_language_display_name(lang_code: str, fallback_to_english: bool = False)
     获取语言的显示名称（优先中文，可选英文回退）
 
     优先级：
-    1. 中文自定义名称（LANGUAGE_NAMES）
-    2. pycountry 英文名称（fallback_to_english=True 时）
-    3. 原始代码
+    1. 自定义特殊名称（SPECIAL_LANGUAGE_NAMES）
+    2. 统一语言元数据（LANGUAGE_LABELS）
+    3. pycountry 英文名称（fallback_to_english=True 时）
+    4. 原始代码
 
     Args:
         lang_code: 语言代码
@@ -482,25 +464,64 @@ def get_language_display_name(lang_code: str, fallback_to_english: bool = False)
         >>> get_language_display_name("swa", fallback_to_english=True)
         "Swahili"
     """
-    # 1. 优先使用中文自定义名称
-    if lang_code in LANGUAGE_NAMES:
-        return LANGUAGE_NAMES[lang_code]
+    # 1. 优先使用特殊名称
+    if lang_code in SPECIAL_LANGUAGE_NAMES:
+        return SPECIAL_LANGUAGE_NAMES[lang_code]
 
-    # 2. 尝试使用 pycountry（英文名称）
+    normalized_display_code = normalize_language_code(lang_code, "keep_chinese")
+    if normalized_display_code in SPECIAL_LANGUAGE_NAMES:
+        return SPECIAL_LANGUAGE_NAMES[normalized_display_code]
+
+    normalized_code = normalize_language_code(lang_code, "alpha_2").lower()
+
+    # 2. 统一语言元数据
+    meta = LANGUAGE_LABELS.get(normalized_code)
+    if meta:
+        return meta["display_name"]
+
+    # 3. 尝试使用 pycountry（英文名称）
     if fallback_to_english:
-        # 先规范化为标准代码
-        normalized = normalize_language_code(lang_code, "alpha_2")
-        lang = _lookup_language(normalized)
+        lang = _lookup_language(normalized_code)
 
-        if not lang:
+        if not lang and normalized_code != lang_code:
             # 尝试原始代码
             lang = _lookup_language(lang_code)
 
         if lang:
             return lang.name  # 返回英文名称
 
-    # 3. 返回原始代码
+    # 4. 返回原始代码
     return lang_code
+
+
+def get_subtitle_language_short(lang_code: str) -> str:
+    """
+    根据语言代码推导字幕双语简称
+
+    例如：
+    - eng -> 英
+    - jpn -> 日
+    - fra -> 法
+
+    无法推导时返回空字符串。
+    """
+    if not lang_code or lang_code in ["und", "zho", "chi", "zh", "zh-Hans", "zh-Hant"]:
+        return ""
+
+    normalized_code = normalize_language_code(lang_code, "alpha_2").lower()
+
+    # 1. 优先按标准语言代码映射
+    meta = LANGUAGE_LABELS.get(normalized_code)
+    if meta and meta.get("subtitle_short"):
+        return meta["subtitle_short"]
+
+    # 2. 尝试从中文显示名提取简称
+    display_name = get_language_display_name(lang_code, fallback_to_english=False)
+    for short in SUBTITLE_SHORTS:
+        if short in display_name:
+            return short
+
+    return ""
 
 
 def find_executable(tool_name: str) -> Optional[str]:
@@ -530,31 +551,69 @@ def check_tools() -> None:
     console = Console()
 
     required = {
-        "mkvmerge": "MKVToolNix",
+        "mkvmerge": "mkvmerge",
+        "ffprobe": "ffprobe",
+    }
+    version_args = {
+        "mkvmerge": ["--version"],
+        "ffprobe": ["-version"],
     }
 
-    optional = {"ffprobe": "FFmpeg", "mediainfo": "MediaInfo"}
-
     missing_required = []
-    missing_optional = []
+    no_permission_required = []
+    broken_required = []
 
     for tool, name in required.items():
-        if not find_executable(tool):
+        tool_path = find_executable(tool)
+        if not tool_path:
             missing_required.append(name)
+            continue
 
-    for tool, name in optional.items():
-        if not find_executable(tool):
-            missing_optional.append(name)
+        if not sys.platform.startswith("win") and not os.access(tool_path, os.X_OK):
+            no_permission_required.append(tool_path)
+            continue
+
+        try:
+            result = subprocess.run(
+                [tool_path, *version_args[tool]],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            tool_status = "ok" if result.returncode == 0 else "broken"
+        except PermissionError:
+            tool_status = "permission"
+        except (OSError, subprocess.SubprocessError):
+            tool_status = "broken"
+
+        if tool_status == "permission":
+            no_permission_required.append(tool_path)
+        elif tool_status == "broken":
+            broken_required.append(name)
 
     if missing_required:
         console.print(f"[red]错误：缺少必需工具 - {', '.join(missing_required)}[/red]")
-        console.print("请确保这些工具已安装并在 PATH 中")
+        console.print("请确保对应可执行文件已安装，并且位于 CUSTOM_PATHS、脚本目录或系统 PATH 中")
         sys.exit(1)
 
-    # if len(missing_optional) == len(optional):
-    # console.print("[red]错误：ffprobe 和 mediainfo 至少需要一个[/red]")
-    # console.print("请安装 FFmpeg 或 MediaInfo")
-    # sys.exit(1)
+    if no_permission_required:
+        console.print("[red]错误：以下工具缺少执行权限[/red]")
+        for tool_path in no_permission_required:
+            console.print(f"  - {tool_path}")
+        if not sys.platform.startswith("win"):
+            console.print("[yellow]请使用下面的命令授予执行权限：[/yellow]")
+            for tool_path in no_permission_required:
+                console.print(f"chmod +x {shlex.quote(tool_path)}")
+        else:
+            console.print("[yellow]请检查文件权限、来源限制或安全软件拦截。[/yellow]")
+        sys.exit(1)
+
+    if broken_required:
+        console.print(f"[red]错误：以下必需工具存在但无法正常运行 - {', '.join(broken_required)}[/red]")
+        console.print("请检查工具文件是否损坏、依赖是否完整，或路径是否指向了错误的可执行文件")
+        sys.exit(1)
 
     console.print("[green]✓ 工具链检查通过[/green]")
 
@@ -596,6 +655,26 @@ def truncate_to_display_width(text: str, max_width: int, placeholder: str = "...
 def sanitize_filename(filename: str) -> str:
     """替换文件名中的非法字符并清理首尾空格（Windows 兼容）"""
     return "".join(ILLEGAL_CHAR_MAP.get(char, char) for char in filename).strip()
+
+
+def interactive_input(prompt_text: str = "") -> str:
+    """统一交互输入，优先使用 prompt_toolkit 提供历史记录和方向键支持。"""
+    global _PROMPT_SESSION
+
+    stdin_is_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+    stdout_is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+    if PromptSession and InMemoryHistory and AutoSuggestFromHistory and stdin_is_tty and stdout_is_tty:
+        try:
+            if _PROMPT_SESSION is None:
+                _PROMPT_SESSION = PromptSession(history=InMemoryHistory(), auto_suggest=AutoSuggestFromHistory())
+            return _PROMPT_SESSION.prompt(prompt_text)
+        except (KeyboardInterrupt, EOFError):
+            raise
+        except Exception:
+            pass
+
+    return input(prompt_text)
 
 
 def extract_bitrate_from_line(line: str) -> float:
@@ -1210,9 +1289,9 @@ def parse_subtitle_components(desc: str) -> Dict[str, Optional[str]]:
         components["script"] = "繁体"
 
     # 5. 提取语言标识 (用于双语字幕)
-    for lang_key in SUBTITLE_LANG_SHORT.keys():
+    for lang_key, lang_short in SUBTITLE_TEXT_MARKERS:
         if lang_key in desc:
-            components["language"] = SUBTITLE_LANG_SHORT[lang_key]
+            components["language"] = lang_short
             break
 
     # 6. 检测双语/特效标识
@@ -1279,10 +1358,16 @@ def reconstruct_subtitle_desc(components: Dict[str, Optional[str]], track_lang: 
     # 2. 双语特效字幕
     if components["has_bilingual"] and components["has_feature"]:
         script_short = "简" if components["script"] == "简体" or components["script"] is None else "繁"
-        lang = components["language"] or "英"  # 默认英语
+        lang = components["language"] or get_subtitle_language_short(track_lang) or "英"
         return f"{script_short}{lang}双语特效{pos_suffix}"
 
-    # 3. 配音字幕(带特效)
+    # 3. 双语字幕（无特效）
+    if components["has_bilingual"] and not components["has_feature"] and not components["has_commentary"] and not components["dubbing"]:
+        script_short = "简" if components["script"] == "简体" or components["script"] is None else "繁"
+        lang = components["language"] or get_subtitle_language_short(track_lang) or "英"
+        return f"{original_disc_prefix}{script_short}{lang}双语{pos_suffix}"
+
+    # 4. 配音字幕(带特效)
     if components["dubbing"] and components["has_feature"]:
         script = components["script"] or ("简体" if components["dubbing"] == "国配" else "")
         region = components["region"]
@@ -1301,7 +1386,7 @@ def reconstruct_subtitle_desc(components: Dict[str, Optional[str]], track_lang: 
         else:
             return f"{base_desc}{pos_suffix}"
 
-    # 4. 配音字幕(不带特效)
+    # 5. 配音字幕(不带特效)
     if components["dubbing"]:
         script = components["script"] or ("简体" if components["dubbing"] == "国配" else "")
         region = components["region"]
@@ -1318,7 +1403,7 @@ def reconstruct_subtitle_desc(components: Dict[str, Optional[str]], track_lang: 
         else:
             return f"{original_disc_prefix}{base_desc}{pos_suffix}"
 
-    # 5. 普通单语特效字幕（有特效、无配音、无双语、无导评）
+    # 6. 普通单语特效字幕（有特效、无配音、无双语、无导评）
     if components["has_feature"] and not components["has_bilingual"] and not components["has_commentary"] and not components["dubbing"]:
         if components["script"] and not components["language"]:
             base_desc = f"{components['script']}特效"
@@ -1327,7 +1412,7 @@ def reconstruct_subtitle_desc(components: Dict[str, Optional[str]], track_lang: 
             else:
                 return f"{original_disc_prefix}{base_desc}{pos_suffix}"
 
-    # 6. 普通简繁字幕 (无特效、无配音、无双语、无导评)
+    # 7. 普通简繁字幕 (无特效、无配音、无双语、无导评)
     if not components["has_feature"] and not components["has_bilingual"] and not components["has_commentary"] and not components["dubbing"]:
         if components["script"]:
             base_desc = f"{components['script']}中文"  # 自动拼接出 "简体中文" / "繁体中文"
@@ -1336,7 +1421,7 @@ def reconstruct_subtitle_desc(components: Dict[str, Optional[str]], track_lang: 
             else:
                 return f"{original_disc_prefix}{base_desc}{pos_suffix}"
 
-    # 7. 其他: 保持原描述
+    # 8. 其他: 保持原描述
     return components["raw_desc"]
 
 
@@ -1926,6 +2011,10 @@ class TrackSorter:
         # 双语特效（最高优先级）
         if "双语特效" in desc:
             return 10
+
+        # 普通双语（次高优先级）
+        if "双语" in desc:
+            return 9
 
         # 单语特效（第二优先级）
         if "特效" in desc and "双语" not in desc:
@@ -2867,7 +2956,7 @@ class InteractiveCLI:
             self.console.print()
             self.display_tracks(tracks, source_name=source_name)
 
-            cmd = input("\n>>> ").strip()
+            cmd = interactive_input("\n>>> ").strip()
 
             # 结束或返回
             if not cmd or cmd.lower() == "done":
@@ -3029,7 +3118,7 @@ class InteractiveCLI:
             self.display_tracks(all_tracks, view_title, filtered_ids=current_filtered_ids, source_name=source_name)
             self.console.print("[dim]命令: add <ID> (恢复轨道) | orig / sorted / view (切换视图) | 回车 (返回)[/dim]")
 
-            cmd = input(">>> ").strip().lower()
+            cmd = interactive_input(">>> ").strip().lower()
             if not cmd or cmd in ("done", "quit", "exit", "back"):
                 break
 
@@ -3137,7 +3226,7 @@ class InteractiveCLI:
 
         # 用户选择
         while True:
-            choice = input(f"\n请选择正片 [1-{len(candidates)}，默认 1，back 返回]: ").strip()
+            choice = interactive_input(f"\n请选择正片 [1-{len(candidates)}，默认 1，back 返回]: ").strip()
             if choice.lower() == "back":
                 return -2  # 触发 back 返回上一级
             if not choice:
@@ -3296,7 +3385,7 @@ def build_mkvmerge_command(
     Returns:
         mkvmerge 命令参数列表
     """
-    cmd = ["mkvmerge", "-o", output_path]
+    cmd = [find_executable("mkvmerge") or "mkvmerge", "-o", output_path]
 
     # 标题
     if title:
@@ -3517,6 +3606,56 @@ def find_bdinfo_for_source(source: Dict, bdinfo_dir: Optional[Path] = None) -> O
     return next((c for c in candidates if c.is_file()), None)
 
 
+def prompt_for_missing_bdinfo_text(
+    source_name: str,
+    console: Console,
+    cache_dir: Optional[Path] = None,
+    input_fn: Callable[[str], str] = input,
+) -> Optional[Path]:
+    """
+    本地缺少 BDInfo 文本时，引导用户在控制台粘贴完整内容并缓存为临时 txt
+
+    使用方式：
+    1. 将完整 BDInfo 文本直接粘贴到控制台
+    2. 单独输入一行 EOF 结束
+    3. 第一行直接回车表示取消
+    """
+    console.print(f"[yellow]未找到 BDInfo 文本：{source_name}[/yellow]")
+    console.print("  [cyan]请将完整 BDInfo 文本粘贴到控制台[/cyan]")
+    console.print(f"  [dim]粘贴完成后，单独输入 {BDINFO_PASTE_SENTINEL} 结束；第一行直接回车则跳过该原盘[/dim]")
+
+    lines = []
+    while True:
+        try:
+            line = input_fn("")
+        except EOFError:
+            if not lines:
+                return None
+            break
+
+        if not lines and not line.strip():
+            return None
+
+        if line.strip() == BDINFO_PASTE_SENTINEL:
+            break
+
+        lines.append(line)
+
+    content = "\n".join(lines).strip()
+    if not content:
+        return None
+
+    target_dir = cache_dir or (Path(tempfile.gettempdir()) / "bluray_remux_bdinfo")
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_name = sanitize_filename(source_name) or "bdinfo"
+    bdinfo_path = target_dir / f"{safe_name}_pasted_bdinfo.txt"
+    bdinfo_path.write_text(content + "\n", encoding="utf-8")
+
+    console.print(f"[green]✓ 已缓存粘贴的 BDInfo：{bdinfo_path}[/green]")
+    return bdinfo_path
+
+
 def scan_mpls_files(bdmv_path: Path) -> List[Dict]:
     """扫描所有 MPLS 文件并计算候选正片"""
     console = Console()
@@ -3585,7 +3724,7 @@ def scan_mpls_files(bdmv_path: Path) -> List[Dict]:
 
 
 # ==============================================================================
-# 音轨扫描（ffprobe/mediainfo）
+# 音轨扫描（ffprobe）
 # ==============================================================================
 
 
@@ -4992,13 +5131,19 @@ def batch_phase2_match_bdinfo(sources: List[Dict], bdinfo_dir: Optional[Path], c
     console.print("[bold cyan]阶段 2：匹配 BDInfo 和推断原语言[/bold cyan]")
 
     tasks = []
+    stdin_is_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+
     for source in sources:
         bdinfo_path = find_bdinfo_for_source(source, bdinfo_dir)
 
         if bdinfo_path is None:
-            console.print(f"[yellow]警告：未找到 BDInfo - {source['name']}[/yellow]")
-            console.print("  [dim]→ 已自动忽略该原盘，将不参与本次后续处理[/dim]")
-            continue
+            if stdin_is_tty:
+                bdinfo_path = prompt_for_missing_bdinfo_text(source["name"], console)
+
+            if bdinfo_path is None:
+                console.print(f"[yellow]警告：未找到 BDInfo - {source['name']}[/yellow]")
+                console.print("  [dim]→ 已自动忽略该原盘，将不参与本次后续处理[/dim]")
+                continue
 
         original_lang = infer_original_lang_from_bdinfo(bdinfo_path)
 
@@ -5064,7 +5209,7 @@ def batch_phase3_confirm_tasks(tasks: List[Dict], skip_interactive: bool, consol
         console.print("[dim]  cancel                  - 取消批量处理[/dim]\n")
 
         while True:
-            cmd = input(">>> ").strip()
+            cmd = interactive_input(">>> ").strip()
 
             if not cmd or cmd.lower() == "done":
                 break
@@ -5109,7 +5254,7 @@ def batch_phase3_confirm_tasks(tasks: List[Dict], skip_interactive: bool, consol
         console.print()
 
         while True:
-            mode_choice = input("请选择模式 [1/2] (默认 1): ").strip()
+            mode_choice = interactive_input("请选择模式 [1/2] (默认 1): ").strip()
             if not mode_choice:
                 mode_choice = "1"
 

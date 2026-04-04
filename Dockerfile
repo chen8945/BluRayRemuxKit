@@ -3,9 +3,11 @@ FROM python:3.13-slim-bookworm AS app-builder
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends binutils \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir pyinstaller pycountry rich
+    && pip install --no-cache-dir pyinstaller
 
 WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY bluray_remux.py .
 
 RUN pyinstaller \

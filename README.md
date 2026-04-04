@@ -24,15 +24,27 @@
 
 ---
 
-## BDInfo 匹配与快捷写入
+## BDInfo 匹配与输入
 
 ### 匹配规则（按优先级）
 1. **同名优先** — 在原盘同目录下查找 `{原盘名}.txt` 或 `{原盘名}_bdinfo.txt`
 2. **向上回溯** — 从原盘所在目录开始，向上最多回溯 3 层查找 `bdinfo.txt`
 3. **统一目录** — 在 `--bdinfo-dir` 参数指定的目录下查找同名 txt
+4. **控制台粘贴兜底** — 如果以上位置都没找到 BDInfo，脚本会在交互终端中提示你直接粘贴完整 BDInfo 文本，并缓存成临时 txt 继续处理
 
-### 快捷新建并写入文本
-利用终端的 `EOF` 语法，可以一步到位新建 txt 文件并写入 BDInfo。这套操作**非常适合搭配下文的「不使用 Docker Compose」在原盘目录下直接使用**。
+### 推荐方式：直接在控制台粘贴
+正常情况下不再需要手动新建 `txt` 文件。
+
+使用方式：
+1. 直接运行脚本或容器命令
+2. 如果脚本没有在本地找到匹配的 BDInfo 文本，会在控制台提示你粘贴完整 BDInfo
+3. 粘贴完成后，单独输入 `EOF` 结束
+4. 脚本会自动缓存为临时 txt，并继续后续处理
+
+### 可选方式：手动新建 txt
+如果你希望复用同一份 BDInfo，或者想避免重复粘贴，也仍然可以手动新建 txt 文件。
+
+利用终端的 `EOF` 语法，可以一步到位新建 txt 文件并写入 BDInfo。
 
 **方式一：在当前目录下创建**
 如果已经 `cd` 进入了原盘所在目录，直接执行：
@@ -70,12 +82,12 @@ docker pull ghcr.io/chen8945/bluray-remuxkit:latest
 
 ### 不使用 Docker Compose
 
-如果不想繁琐地配置 Compose 文件夹，希望配合前面的 [BDInfo 写入](#快捷新建并写入文本) 命令直接在原盘目录下丝滑操作，这是最推荐的方式。
+如果不想繁琐地配置 Compose 文件夹，直接在原盘目录下运行即可，这是最推荐的方式。
 
 **操作流：**
 1. 在终端中 `cd` 进入包含蓝光原盘的目录。
-2. 使用 `cat << 'EOF' > "原盘名.txt"` 写入 BDInfo。
-3. 直接粘贴执行以下命令：
+2. 直接粘贴执行以下命令：
+3. 如果运行过程中提示缺少 BDInfo，就把完整 BDInfo 文本粘贴进控制台，并单独输入 `EOF` 结束。
 
 ```bash
 docker run --rm -it \
@@ -174,13 +186,18 @@ docker compose run --rm remuxkit \
 - **环境**：Python 3.10+
 - **核心工具**：
   - [mkvmerge](https://mkvtoolnix.download/)（MKVToolNix）
-  - [ffprobe](https://ffmpeg.org/)（FFmpeg）
+  - [ffprobe](https://ffmpeg.org/)（FFprobe，可单独安装，不要求完整 FFmpeg）
 - **Python 库**：`rich`、`pycountry`
+- **可选增强输入依赖**：`prompt_toolkit`
+  - 用于改善 SSH / Linux / Windows 下的交互输入体验，支持上下键历史、左右移动与更自然的命令行编辑
+  - 未安装时，脚本会自动回退到原生 `input()`，不影响基本功能
 
 ### 安装依赖
 ```bash
-pip install rich pycountry
+pip install -r requirements.txt
 ```
+
+`requirements.txt` 已包含 `prompt_toolkit`，安装后可直接获得增强交互输入体验；即使缺少该库，脚本仍会自动回退到原生 `input()`。
 
 ### 执行命令
 ```bash
