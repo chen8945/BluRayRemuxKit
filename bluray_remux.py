@@ -90,8 +90,12 @@ LANGUAGE_VARIANTS = {
     }
 }
 
+CHINESE_VARIANT_CODES = set(LANGUAGE_VARIANTS)
+CHINESE_LANGUAGE_CODES = {"zho", "chi", "zh", *CHINESE_VARIANT_CODES}
+
 # 语言显示/字幕简称元数据（统一维护，别名交由 pycountry 归一）
 LANGUAGE_LABELS = {
+    "cs": {"display_name": "捷克语", "subtitle_short": "捷"},
     "en": {"display_name": "英语", "subtitle_short": "英"},
     "ja": {"display_name": "日语", "subtitle_short": "日"},
     "ko": {"display_name": "韩语", "subtitle_short": "韩"},
@@ -101,7 +105,9 @@ LANGUAGE_LABELS = {
     "it": {"display_name": "意大利语", "subtitle_short": "意"},
     "ru": {"display_name": "俄语", "subtitle_short": "俄"},
     "pt": {"display_name": "葡萄牙语", "subtitle_short": "葡"},
+    "sv": {"display_name": "瑞典语", "subtitle_short": "瑞"},
     "th": {"display_name": "泰语"},
+    "vi": {"display_name": "越南语", "subtitle_short": "越"},
     "hu": {"display_name": "匈牙利语"},
     "pl": {"display_name": "波兰语"},
     "tr": {"display_name": "土耳其语"},
@@ -122,7 +128,7 @@ SPECIAL_LANGUAGE_NAMES = {
 # 2. 音频地区权重排序：同语言、同编码时按 region 列表顺序排序
 # 3. 字幕地区权重排序：同类型字幕按 region 列表顺序排序
 TRACK_KEYWORDS = {
-    "region": ["八一公映", "公映", "央视长译", "央视", "长译", "东影上译", "东影", "上译", "北影", "中影", "华纳", "六区", "东森", "新索"],  # 地区/版本标识（列表顺序 = 排序优先级）
+    "region": ["八一公映", "公映", "央视长译", "央视", "长译", "东影上译", "东影", "上译", "北影", "中影", "华纳", "六区", "德加拉", "东森", "新索"],  # 地区/版本标识（列表顺序 = 排序优先级）
     "mandarin": ["国语", "国配"],                     # 国语标识
     "dialect": ["台配", "粤配", "粤语", "港配"],        # 方言标识
     "commentary": ["导评", "评论", "commentary"]      # 导评标识
@@ -135,10 +141,12 @@ ILLEGAL_CHAR_MAP = {"?": "？", "*": "★", "<": "《", ">": "》", ":": "：", 
 
 # 数值常量
 MIN_FEATURE_DURATION = 1800  # 最小正片时长（秒），30分钟
+LOW_VALUE_SUBTITLE_BITRATE_KBPS = 2  # 精简字幕时丢弃极低码率字幕
 
 # 正则表达式常量（用于 BDInfo 解析）
-AUDIO_LANGUAGES_PATTERN = r"(English|French|German|Japanese|Chinese|Korean|Czech|Spanish|Italian|Russian|Portuguese)"
-SUBTITLE_LANGUAGES_PATTERN = r"(English|Japanese|Chinese|Korean|French|German|Spanish|Italian|Russian|Portuguese|Thai|Vietnamese|Czech)"
+BDINFO_LANGUAGES_PATTERN = (r"(Chinese|Czech|English|French|German|Italian|Japanese|Korean|Portuguese|Russian|Spanish|Swedish|Thai|Vietnamese)")
+AUDIO_LANGUAGES_PATTERN = BDINFO_LANGUAGES_PATTERN
+SUBTITLE_LANGUAGES_PATTERN = BDINFO_LANGUAGES_PATTERN
 BITRATE_KBPS_PATTERN = r"([\d,]+\.?\d*)\s*kbps?"  # 支持小数（如字幕码率：26.685 kbps），容错 kbp/kbps
 BITRATE_MBPS_PATTERN = r"([\d.]+)\s*Mbps"
 SDH_PATTERN = re.compile(r"(?i)\s*\(?(SDH|CC|听障|聋哑)\)?")
@@ -215,7 +223,7 @@ def _is_chinese_variant(lang_code: str) -> bool:
     Returns:
         如果是自定义中文变体返回 True
     """
-    return lang_code in LANGUAGE_VARIANTS
+    return lang_code in CHINESE_VARIANT_CODES
 
 
 def normalize_language_code(lang_code: str, target_format: str = "alpha_2") -> str:
@@ -381,6 +389,9 @@ def _clean_channels_str(raw: str) -> str:
     if not raw:
         return ""
     base = raw.split("+")[0].strip() if "+" in raw else raw.strip()
+    match = re.search(r"(\d+\.\d+)", base)
+    if match:
+        return match.group(1)
     return base.replace("-Atmos", "").replace("-X", "")
 
 
@@ -505,7 +516,7 @@ def get_subtitle_language_short(lang_code: str) -> str:
 
     无法推导时返回空字符串。
     """
-    if not lang_code or lang_code in ["und", "zho", "chi", "zh", "zh-Hans", "zh-Hant"]:
+    if not lang_code or lang_code == "und" or lang_code in CHINESE_LANGUAGE_CODES:
         return ""
 
     normalized_code = normalize_language_code(lang_code, "alpha_2").lower()
@@ -522,6 +533,18 @@ def get_subtitle_language_short(lang_code: str) -> str:
             return short
 
     return ""
+
+
+def normalize_match_language(lang_code: str) -> str:
+    """统一轨道匹配时的语言代码，收敛简繁中文和常见别名。"""
+    if not lang_code or lang_code == "und":
+        return "und"
+
+    normalized = normalize_language_code(lang_code, "keep_chinese")
+    if normalized in CHINESE_LANGUAGE_CODES:
+        return "zho"
+
+    return normalize_language_code(lang_code, "alpha_3")
 
 
 def find_executable(tool_name: str) -> Optional[str]:
@@ -1148,7 +1171,7 @@ def parse_audio_custom_desc(custom_desc: str, language: str) -> Optional[str]:
         return None
 
     # 仅处理中文音轨（支持 ISO 639-1 和 ISO 639-2 变体）
-    if language not in ["zho", "chi", "zh-Hans", "zh-Hant", "zh"]:
+    if language not in CHINESE_LANGUAGE_CODES:
         return None
 
     # 获取关键词配置
@@ -1289,8 +1312,19 @@ def parse_subtitle_components(desc: str) -> Dict[str, Optional[str]]:
         components["script"] = "繁体"
 
     # 5. 提取语言标识 (用于双语字幕)
+    # 先屏蔽地区/配音关键词，避免把“德加拉国语”中的“德”误判成双语外语简称
+    desc_for_language = desc
+    ignored_keywords = set(TRACK_KEYWORDS["region"] + TRACK_KEYWORDS["mandarin"] + TRACK_KEYWORDS["dialect"])
+    if components["region"]:
+        ignored_keywords.add(components["region"])
+    if components["dubbing"]:
+        ignored_keywords.add(components["dubbing"])
+
+    for keyword in sorted(ignored_keywords, key=len, reverse=True):
+        desc_for_language = desc_for_language.replace(keyword, " ")
+
     for lang_key, lang_short in SUBTITLE_TEXT_MARKERS:
-        if lang_key in desc:
+        if lang_key in desc_for_language:
             components["language"] = lang_short
             break
 
@@ -1299,7 +1333,7 @@ def parse_subtitle_components(desc: str) -> Dict[str, Optional[str]]:
     components["has_feature"] = "特效" in desc
 
     # 智能补充双语判定：如果没有"双语"字眼，但同时包含了外语标识（如"英"）和中文标识（"简"/"繁"/"中"）
-    if components["language"] and any(char in desc for char in ["简", "繁", "中"]):
+    if components["language"] and any(char in desc_for_language for char in ["简", "繁", "中"]):
         components["has_bilingual"] = True
 
     # 7. 提取并统一位置标识（关键词分组）
@@ -1348,7 +1382,7 @@ def reconstruct_subtitle_desc(components: Dict[str, Optional[str]], track_lang: 
         elif lang:
             # 拼上"文"字，将"英"变成"导评英语"
             return f"{original_disc_prefix}导评{lang}语{num}{pos_suffix}"
-        elif track_lang != "und" and track_lang not in ["zho", "chi", "zh", "zh-Hans", "zh-Hant"]:
+        elif track_lang != "und" and track_lang not in CHINESE_LANGUAGE_CODES:
             # 使用实际轨道语言名称（如 "eng" 会被转成 "英语"）
             real_lang = get_language_display_name(track_lang)
             return f"{original_disc_prefix}导评{real_lang}{num}{pos_suffix}"
@@ -1532,6 +1566,9 @@ class Track:
         # AC3 核心轨道标记
         self.is_ac3_core = False  # AC3 核心轨道标记
         self.parent_truehd_id = None  # 父 TrueHD 轨道 ID
+        self.bdinfo_checked = False  # 是否已尝试匹配 BDInfo
+        self.matched_bdinfo = False  # 是否成功匹配到 BDInfo
+        self.is_hidden = False  # 是否为 BDInfo 标记的隐藏轨
 
     @property
     def display_id(self) -> str:
@@ -1753,7 +1790,7 @@ class TrackSorter:
 
     def is_chinese(self, lang: str) -> bool:
         """判断是否为中文语言代码"""
-        return lang in ["zho", "chi", "zh-Hans", "zh-Hant"]
+        return lang in CHINESE_LANGUAGE_CODES
 
     def _is_english(self, lang: str) -> bool:
         """判断是否为英语"""
@@ -1818,14 +1855,33 @@ class TrackSorter:
                 best_tracks[key] = track
             else:
                 existing_track = best_tracks[key]
-                # 开启最高规格模式：直接比较已有的排序权重（权重 tuple 越小越优秀）
+                # 非 hidden 轨优先于 hidden 轨
+                if existing_track.is_hidden and not track.is_hidden:
+                    best_tracks[key] = track
+                    continue
+                if track.is_hidden and not existing_track.is_hidden:
+                    continue
+
+                should_replace = False
                 if self.keep_best_audio:
+                    # 开启最高规格模式：直接比较已有的排序权重（权重 tuple 越小越优秀）
                     if self._audio_sort_key(track) < self._audio_sort_key(existing_track):
-                        best_tracks[key] = track
-                # 原有去重逻辑：同编码同声道下保留码率更高的
+                        should_replace = True
+                # 同编码同声道下保留码率更高的
                 else:
                     if track.bitrate > existing_track.bitrate:
-                        best_tracks[key] = track
+                        should_replace = True
+
+                # 仍然打平时，优先保留原始轨道顺序更靠前的
+                if not should_replace and track.id < existing_track.id:
+                    if self.keep_best_audio:
+                        if self._audio_sort_key(track) == self._audio_sort_key(existing_track):
+                            should_replace = True
+                    elif track.bitrate == existing_track.bitrate:
+                        should_replace = True
+
+                if should_replace:
+                    best_tracks[key] = track
 
         result = []
         seen_keys = set()
@@ -1917,32 +1973,38 @@ class TrackSorter:
             seen_orig = False
 
             for track in sorted_subs:
+                if track.is_commentary:
+                    final_subs.append(track)
+                    continue
+
+                # BDInfo 已尝试匹配但仍未命中的字幕，精简模式下直接丢弃
+                if track.bdinfo_checked and not track.matched_bdinfo:
+                    continue
+
+                # 极低码率字幕通常无实际意义，精简模式下直接丢弃
+                if track.bitrate and track.bitrate < LOW_VALUE_SUBTITLE_BITRATE_KBPS:
+                    continue
+
                 # 1. 中文字幕：永远保留
                 if self.is_chinese(track.language):
                     final_subs.append(track)
                     continue
 
-                # 2. 导评字幕：如果能走到这里，说明用户没有开启 drop_commentary。
-                # 直接无条件保留，且绝对不占用正片常规字幕的名额！
-                if track.is_commentary:
-                    final_subs.append(track)
-                    continue
-
-                # 3. 英语常规字幕：只保留第一条（最优的正片字幕）
+                # 2. 英语常规字幕：只保留第一条（最优的正片字幕）
                 if self._is_english(track.language):
                     if not seen_eng:
                         final_subs.append(track)
                         seen_eng = True
                     continue
 
-                # 4. 原语言常规字幕（非英语且非中文）：只保留第一条
+                # 3. 原语言常规字幕（非英语且非中文）：只保留第一条
                 if track.language == self.original_lang:
                     if not seen_orig:
                         final_subs.append(track)
                         seen_orig = True
                     continue
 
-                # 5. 兜底：其他语言（安全保留）
+                # 4. 兜底：其他语言（安全保留）
                 final_subs.append(track)
 
             return final_subs
@@ -2125,10 +2187,9 @@ def match_track_with_bdinfo(track: Track, bdinfo_tracks: List[Dict], used_indice
         bd_lang = bd_track.get("language", "und")
         track_lang = track.language
 
-        # 规范化语言（chi/zho/zh-Hans 都视为中文）
-        lang_norm = {"chi": "zho", "zh-Hans": "zho", "zh-Hant": "zho", "en": "eng", "ja": "jpn", "ko": "kor"}
-        bd_lang_norm = lang_norm.get(bd_lang, bd_lang)
-        track_lang_norm = lang_norm.get(track_lang, track_lang)
+        # 规范化语言（收敛简繁中文、zh/zho/chi 及常见 ISO 别名）
+        bd_lang_norm = normalize_match_language(bd_lang)
+        track_lang_norm = normalize_match_language(track_lang)
 
         if bd_lang_norm != track_lang_norm and bd_lang != "und" and track_lang != "und":
             continue
@@ -2157,9 +2218,9 @@ def match_track_with_bdinfo(track: Track, bdinfo_tracks: List[Dict], used_indice
 
         # 声道匹配（如果双方都有）
         if track.channels and bd_track.get("channels"):
-            # 提取基础声道部分（去除 objects、-Atmos 和 -X 标识）
-            track_channels_base = track.channels.split("+")[0].strip().replace("-Atmos", "").replace("-X", "")
-            bd_channels_base = bd_track["channels"].split("+")[0].strip().replace("-Atmos", "").replace("-X", "")
+            # 提取基础声道部分（统一复用清洗逻辑，兼容 -IMAX / -EX / -Atmos / -X 等后缀）
+            track_channels_base = _clean_channels_str(track.channels)
+            bd_channels_base = _clean_channels_str(bd_track["channels"])
 
             # 跳过 ffprobe 识别失败的情况（channels=0）
             if track_channels_base == "0ch":
@@ -2344,6 +2405,8 @@ class BDInfoParser:
                 continue
 
             track = {}
+            stripped_line = line.lstrip()
+            track["is_hidden"] = stripped_line.startswith("*")
 
             # Codec（从行内容判断）
             # 注意：content 已在 parse() 方法中规范化过 Unicode 空格
@@ -2369,7 +2432,7 @@ class BDInfoParser:
             track["full_bitrate"] = bitrate  # 保存完整码率
 
             # 提取声道（2.0 / 5.1 / 7.1 / 7.1-Atmos / 7.1-X / 7.1+11 objects）
-            channels_match = re.search(r"(\d+\.\d+(?:-Atmos|-X)?(?:\+\d+\s+objects)?)\s*/", line)
+            channels_match = re.search(r"(\d+\.\d+(?:\+\d+\s+objects)?(?:-[A-Za-z0-9]+)?)\s*/", line)
             if channels_match:
                 track["channels"] = channels_match.group(1)
             else:
@@ -2445,6 +2508,8 @@ class BDInfoParser:
                 continue
 
             track = {}
+            stripped_line = line.lstrip()
+            track["is_hidden"] = stripped_line.startswith("*")
 
             # Codec（通常是 "Presentation Graphics"）
             track["codec"] = "pgs"
@@ -2660,7 +2725,7 @@ class InteractiveCLI:
         caption = f"[dim]当前编辑原盘：{source_name}[/dim]" if source_name else None
         table = Table(title=title, show_header=True, header_style="bold cyan", caption=caption, caption_justify="right")
         table.add_column("#", style="dim", width=3, justify="right")
-        table.add_column("ID", style="yellow", width=4)
+        table.add_column("ID", style="yellow", width=6)
         table.add_column("类型", width=6)
         table.add_column("格式", width=format_width)
         table.add_column("语言", width=10)
@@ -2694,11 +2759,11 @@ class InteractiveCLI:
 
             # 语言显示：字幕保持智能识别标签，音频/视频使用 pycountry 转换
             display_lang = get_language_tag(track.language, track.type)
-
-            # 被过滤的轨道使用灰色和 "×" 前缀标记
+            hidden_prefix = "*" if track.is_hidden else ""
+            # 被过滤的轨道使用灰色和 "×" 前缀标记；hidden 轨额外显示 "*" 前缀
             is_filtered = filtered_ids is not None and track.id in filtered_ids
             if is_filtered:
-                id_cell = f"[dim]×{track.display_id}[/dim]"
+                id_cell = f"[dim]× {hidden_prefix}{track.display_id}[/dim]"
                 type_cell = f"[dim]{type_display.get(track.type, track.type)}[/dim]"
                 format_cell = f"[dim]{format_str}[/dim]"
                 lang_cell = f"[dim]{display_lang}[/dim]"
@@ -2706,7 +2771,7 @@ class InteractiveCLI:
                 bitrate_cell = f"[dim]{bitrate_str}[/dim]"
                 default_cell = "[dim]✓[/dim]" if track.is_default else ""
             else:
-                id_cell = track.display_id
+                id_cell = f"{hidden_prefix}{track.display_id}"
                 type_cell = type_display.get(track.type, track.type)
                 format_cell = format_str
                 lang_cell = display_lang
@@ -2951,6 +3016,7 @@ class InteractiveCLI:
         self.console.print("[dim]  - 范围匹配：d S7-S10[/dim]")
         self.console.print("[dim]  - 组合使用：lang S1,S3-S5 zh-Hans[/dim]")
         self.console.print("[dim]  - 切换默认：default S1,S2（已默认则取消）[/dim]\n")
+        self.console.print("[dim]标记说明：* 表示 BDInfo 隐藏轨，× 表示当前未在工作集合中的轨道[/dim]\n")
 
         while True:
             self.console.print()
@@ -4182,7 +4248,7 @@ def scan_main_tracks(bdmv_path: Path, chapter: Chapter, console: Console, verbos
         console.print(f"[green]✓ 扫描完成[/green]")
         console.print(f"  视频轨：{sum(1 for t in tracks if t.type == 'video')} 个")
         console.print(f"  音频轨：{sum(1 for t in tracks if t.type == 'audio')} 个")
-        console.print(f"  字幕轨：{sum(1 for t in tracks if t.type == 'subtitle')} 个\n")
+        console.print(f"  字幕轨：{sum(1 for t in tracks if t.type == 'subtitle')} 个")
 
     return tracks
 
@@ -4288,7 +4354,7 @@ def workflow_phase2_parse_bdinfo(bdinfo_path: Optional[Path], mpls_name: str, co
         console.print(f"[green]✓ 已解析 BDInfo[/green]")
         console.print(f"  PLAYLIST：{bdinfo_data['playlist']}")
         console.print(f"  音轨：{len(bdinfo_data['audio'])} 个")
-        console.print(f"  字幕：{len(bdinfo_data['subtitle'])} 个\n")
+        console.print(f"  字幕：{len(bdinfo_data['subtitle'])} 个")
 
     return bdinfo_data
 
@@ -4365,7 +4431,7 @@ def _debug_unmatched_track(track: Track, bdinfo_audio: List[Dict], used_indices:
 
 def _apply_bdinfo_to_track(track: Track, bd_track: Dict, original_lang: str) -> None:
     """
-    将 BDInfo 匹配结果应用到轨道（公共后处理逻辑）
+    将 BDInfo 匹配结果应用到轨道
 
     在轨道成功匹配到 BDInfo 数据后，统一处理自定义描述、导评标志、
     标志位设置和轨道名称生成。码率/声道/语言等差异化逻辑由调用方
@@ -4376,6 +4442,9 @@ def _apply_bdinfo_to_track(track: Track, bd_track: Dict, original_lang: str) -> 
         bd_track: 匹配到的 BDInfo 数据字典
         original_lang: 原始语言代码（用于判断 is_original 等标志）
     """
+    track.matched_bdinfo = True
+    track.is_hidden = bd_track.get("is_hidden", False)
+
     # 自定义描述
     if bd_track.get("custom_desc"):
         track.custom_desc = bd_track["custom_desc"]
@@ -4585,7 +4654,10 @@ def _integrate_audio_main_tracks(
         if bd_track.get("channels"):
             track.channels = _clean_channels_str(bd_track["channels"])
 
-        # 公共后处理：自定义描述 + 标志位 + 生成轨道名
+        if track.language == "und" and bd_track.get("language"):
+            track.language = bd_track["language"]
+
+        # 自定义描述 + 标志位 + 生成轨道名
         _apply_bdinfo_to_track(track, bd_track, original_lang)
 
 
@@ -4653,7 +4725,10 @@ def _integrate_audio_ac3_tracks(
             if bd_track.get("channels"):
                 track.channels = _clean_channels_str(bd_track["channels"])
 
-            # 公共后处理：自定义描述 + 标志位 + 生成轨道名
+            if track.language == "und" and bd_track.get("language"):
+                track.language = bd_track["language"]
+
+            # 自定义描述 + 标志位 + 生成轨道名
             _apply_bdinfo_to_track(track, bd_track, original_lang)
 
 
@@ -4677,6 +4752,7 @@ def _integrate_subtitle_tracks(
     subtitle_tracks_by_index = sorted(subtitle_tracks, key=lambda t: t.id)
 
     for track in subtitle_tracks_by_index:
+        track.bdinfo_checked = True
         bd_idx, bd_track = match_track_with_bdinfo(track, bdinfo_subtitle, used_bdinfo_indices_sub)
         if bd_track is None:
             continue
@@ -4690,7 +4766,7 @@ def _integrate_subtitle_tracks(
         if bd_track.get("language"):
             track.language = bd_track["language"]
 
-        # 公共后处理：自定义描述 + 标志位 + 生成轨道名
+        # 自定义描述 + 标志位 + 生成轨道名
         _apply_bdinfo_to_track(track, bd_track, original_lang)
 
 
@@ -4821,7 +4897,7 @@ def workflow_phase4_integrate_bdinfo(
     for track in audio_tracks:
         debug_print(f"  [dim]Index {track.id}: lang={track.language} codec={track.codec} channels={track.channels} name={track.name}[/dim]")
 
-    console.print(f"[green]✓ 排序完成（原始语言：{original_lang}）[/green]\n")
+    console.print(f"[green]✓ 排序完成（原始语言：{original_lang}）[/green]")
 
     return video_tracks, audio_tracks, subtitle_tracks, view_data
 
@@ -4877,7 +4953,6 @@ def workflow_phase6_extract_metadata(bdmv_path: Path, chapter: Chapter, output_d
             chapters_file = str(output_dir / f"{title}_chapters.txt")
             generate_ogm_chapters(chapter, chapters_file)
             console.print(f"  章节文件：{Path(chapters_file).name}")
-    console.print()
 
     return title, metadata, chapters_file
 
@@ -5266,9 +5341,9 @@ def batch_phase3_confirm_tasks(tasks: List[Dict], skip_interactive: bool, consol
         batch_mode = "sequential" if mode_choice == "1" else "preconfirm"
 
         if batch_mode == "sequential":
-            console.print("[green]✓ 已选择：逐个确认模式[/green]\n")
+            console.print("[green]✓ 已选择：逐个确认模式[/green]")
         else:
-            console.print("[green]✓ 已选择：统一预确认模式[/green]\n")
+            console.print("[green]✓ 已选择：统一预确认模式[/green]")
     else:
         batch_mode = "sequential"
 
@@ -5372,7 +5447,7 @@ def _preconfirm_single_disc(
             console.print(f"[green]✓ 已解析 BDInfo[/green]")
             console.print(f"  PLAYLIST：{bdinfo_data['playlist']}")
             console.print(f"  音轨：{len(bdinfo_data['audio'])} 个")
-            console.print(f"  字幕：{len(bdinfo_data['subtitle'])} 个\n")
+            console.print(f"  字幕：{len(bdinfo_data['subtitle'])} 个")
 
         # 3. 扫描轨道
         console.print("[cyan]→ 扫描轨道信息[/cyan]")
@@ -5399,7 +5474,7 @@ def _preconfirm_single_disc(
             tracks, bdinfo_data, task["original_lang"], disc_drop_commentary, disc_keep_best_audio, disc_simplify_subs
         )
 
-        console.print(f"[green]✓ 排序完成（原始语言：{task['original_lang']}）[/green]\n")
+        console.print(f"[green]✓ 排序完成（原始语言：{task['original_lang']}）[/green]")
 
         # 合并轨道列表
         final_tracks = video_tracks + audio_tracks + subtitle_tracks
