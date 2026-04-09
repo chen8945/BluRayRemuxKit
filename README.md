@@ -13,17 +13,51 @@
 | `-i`, `--input` | **是** | — | 包含蓝光原盘（文件夹）或 ISO 文件的根目录，支持递归扫描多层子目录 |
 | `-o`, `--output` | 否 | `./output` | 输出 MKV 文件的保存目录 |
 | `--bdinfo-dir` | 否 | — | 外部 BDInfo 文本的统一存放目录 |
+| `--commentary` | 否 | `ask` | 导评轨道处理策略（`keep` 保留 / `drop` 剔除 / `ask` 询问） |
+| `--best-audio` | 否 | `ask` | 最高规格音轨精简策略（交互询问时默认 `yes`；`no` 保留全部 / `yes` 仅保留最高规格 / `ask` 询问） |
+| `--simplify-subs` | 否 | `ask` | 外语字幕精简策略（`yes` 默认精简外语 / `no` 全部保留 / `ask` 询问） |
 | `--skip-interactive` | 否 | — | 开启全自动静默模式，跳过所有手动确认和轨道编辑环节 |
 | `--continue-on-error`| 否 | — | 容错模式，某个原盘处理报错时自动跳过并继续处理下一个 |
-| `--commentary` | 否 | `keep` | 导评轨道处理策略（`keep` 保留 / `drop` 剔除 / `ask` 询问） |
-| `--best-audio` | 否 | `no` | 最高规格音轨精简策略（`no` 默认 / `yes` 仅保留最高规格 / `ask` 询问） |
-| `--simplify-subs` | 否 | `yes` | 外语字幕精简策略（`yes` 默认精简外语 / `no` 全部保留 / `ask` 询问） |
+| `--keep-temp` | 否 | — | 保留并复用问题盘 `MakeMKV` 临时 MKV（测试使用，请勿开启） |
+| `--debug` | 否 | — | 输出轨道补全、MakeMKV 回绑匹配、mkvmerge 命令与处理路径等调试信息（测试使用，请勿开启） |
 
 > **💡 路径参数提示：**
 > 在使用 Docker 容器时，参数中的 `-i /input` 和 `-o /output` **通常不需要修改**，因为它们指向的是容器内部的固定绝对路径。只需要在挂载配置（`volumes`）中修改对应的宿主机（本地）路径即可。
 
 ---
 
+## 多段盘处理规则
+
+### 单段盘
+- 单段播放列表直接走原始 `mpls -> mkvmerge` 流程。
+
+### 多段盘预检查
+- 脚本会先读取 `mpls` 对应的分段列表。
+- 预检查仅从 `mkvmerge` 视角验证每个 `m2ts` 分段能否识别到视频轨。
+- 只要任意分段在 `mkvmerge` 中找不到视频轨，就会直接判定为问题盘。
+
+### 普通多段盘
+- 预检查通过后，仍然以播放列表作为基准时间轴进行封装。
+
+### 问题盘
+- 问题盘指的是预检查未通过的多段盘，例如：
+  - 某些分段缺少可被 `mkvmerge` 识别的视频轨。
+  - 分段追加时出现 `--append-to` 轨道对不上的情况。
+- 问题盘会切换到 `MakeMKV` 兜底路径：
+  - 先用 `makemkvcon -r info` 读取原盘并按 `TINFO:16` 精确匹配目标 `MPLS`。
+  - 再按配置文件导出对应标题为临时 MKV，并基于 `mkvmerge -J` 做轨道回绑。
+  - 最终由 `mkvmerge` 以“单输入临时 MKV”完成封装。
+- 隐藏轨处理规则：
+  - 初始工作集合会自动剔除隐藏轨（BDInfo `*` 或 hidden hint）。
+  - 可在交互 `all` 视图中通过 `add` 手动加回。
+  - 但问题盘 MakeMKV 路径会在最终回绑阶段再次忽略隐藏轨，避免匹配失败。
+- `--keep-temp` 未开启时，问题盘流程结束后会自动清理临时 MKV 以及空的 `.__makemkv_fallback` 目录。
+
+### `--skip-interactive` 选片规则
+- 静默模式下，会优先使用 BDInfo 中的 `PLAYLIST` 命中目标 `mpls`。
+- 如果 BDInfo 未能命中，脚本会退回到候选列表第一项，同时在日志中明确提示。
+
+---
 ## BDInfo 匹配与输入
 
 ### 匹配规则（按优先级）
@@ -85,7 +119,7 @@ docker pull ghcr.io/chen8945/bluray-remuxkit:latest
 如果不想繁琐地配置 Compose 文件夹，直接在原盘目录下运行即可，这是最推荐的方式。
 
 **操作流：**
-1. 在终端中 `cd` 进入包含蓝光原盘的目录。
+1. 在终端中 `cd` 进入包含蓝光原盘的目录（注意这里是指多个原盘的存放目录，而不是指单个原盘目录内部，也就是不要进入 BDMV 同级目录）。
 2. 直接粘贴执行以下命令：
 3. 如果运行过程中提示缺少 BDInfo，就把完整 BDInfo 文本粘贴进控制台，并单独输入 `EOF` 结束。
 
@@ -163,6 +197,8 @@ docker compose run --rm remuxkit \
 ```
 
 > ⚠️ **注意**：请务必使用 `docker compose run --rm` 而非 `docker compose up`，因为本容器设计为一次性处理任务，`--rm` 能确保任务结束后自动清理容器。
+>
+> **调试建议**：`--keep-temp` 与 `--debug` 仅用于测试场景，常规批处理请勿开启。
 
 ### ISO 挂载排错说明
 容器内 ISO 挂载需要特定的高级权限（`docker-compose.yaml` 及上方单行命令已预置）：
@@ -187,6 +223,9 @@ docker compose run --rm remuxkit \
 - **核心工具**：
   - [mkvmerge](https://mkvtoolnix.download/)（MKVToolNix）
   - [ffprobe](https://ffmpeg.org/)（FFprobe，可单独安装，不要求完整 FFmpeg）
+- **问题盘兜底工具**（仅问题盘路径需要）：
+  - `MakeMKV`（`makemkvcon`）
+  - `MakeMKV` 配置文件（默认：`D:\MakeMKV\KeepAll.mmcp.xml`，可在脚本 `CUSTOM_PATHS` 中修改）
 - **Python 库**：`rich`、`pycountry`
 - **可选增强输入依赖**：`prompt_toolkit`
   - 用于改善 SSH / Linux / Windows 下的交互输入体验，支持上下键历史、左右移动与更自然的命令行编辑

@@ -34,7 +34,7 @@ import pycountry
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable, List, Dict, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
 from struct import unpack
 from rich.console import Console
 from rich.table import Table
@@ -57,12 +57,15 @@ except ImportError:
 # 调试模式（设置为 True 启用调试输出）
 DEBUG = False
 _PROMPT_SESSION = None
+NO_WINDOW_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # fmt: off
 # 工具路径配置（优先级：自定义路径 > 脚本目录 > 系统 PATH）
 CUSTOM_PATHS = {
     "mkvmerge": "",
     "ffprobe": "",
+    "MakeMKV": "D:/MakeMKV/makemkvcon64.exe",
+    "MakeMKVProfile": "D:/MakeMKV/KeepAll.mmcp.xml",
 }
 
 # 音轨编码权重（用于轨道排序）
@@ -128,7 +131,7 @@ SPECIAL_LANGUAGE_NAMES = {
 # 2. 音频地区权重排序：同语言、同编码时按 region 列表顺序排序
 # 3. 字幕地区权重排序：同类型字幕按 region 列表顺序排序
 TRACK_KEYWORDS = {
-    "region": ["八一公映", "公映", "央视长译", "央视", "长译", "东影上译", "东影", "上译", "北影", "中影", "华纳", "六区", "德加拉", "东森", "新索"],  # 地区/版本标识（列表顺序 = 排序优先级）
+    "region": ["八一公映", "长影公映", "公映", "央视长译", "央视", "长译", "东影上译", "东影", "上译", "北影", "中影", "华纳", "六区", "德加拉", "东森", "新索"],  # 地区/版本标识（列表顺序 = 排序优先级）
     "mandarin": ["国语", "国配"],                     # 国语标识
     "dialect": ["台配", "粤配", "粤语", "港配"],        # 方言标识
     "commentary": ["导评", "评论", "commentary"]      # 导评标识
@@ -144,13 +147,24 @@ MIN_FEATURE_DURATION = 1800  # 最小正片时长（秒），30分钟
 LOW_VALUE_SUBTITLE_BITRATE_KBPS = 2  # 精简字幕时丢弃极低码率字幕
 
 # 正则表达式常量（用于 BDInfo 解析）
-BDINFO_LANGUAGES_PATTERN = (r"(Chinese|Czech|English|French|German|Italian|Japanese|Korean|Portuguese|Russian|Spanish|Swedish|Thai|Vietnamese)")
+BDINFO_LANGUAGES_PATTERN = r"(Chinese|Czech|English|French|German|Italian|Japanese|Korean|Portuguese|Russian|Spanish|Swedish|Thai|Vietnamese)"
 AUDIO_LANGUAGES_PATTERN = BDINFO_LANGUAGES_PATTERN
 SUBTITLE_LANGUAGES_PATTERN = BDINFO_LANGUAGES_PATTERN
 BITRATE_KBPS_PATTERN = r"([\d,]+\.?\d*)\s*kbps?"  # 支持小数（如字幕码率：26.685 kbps），容错 kbp/kbps
 BITRATE_MBPS_PATTERN = r"([\d.]+)\s*Mbps"
 SDH_PATTERN = re.compile(r"(?i)\s*\(?(SDH|CC|听障|聋哑)\)?")
 BDINFO_PASTE_SENTINEL = "EOF"
+MKVMERGE_VIDEO_TRACK_PATTERN = re.compile(r"\bID\s+\d+:\s+video\b", re.IGNORECASE)
+PROBLEM_DISC_ERROR_PATTERNS = [
+    ("audio_channels_mismatch", [r"声道数不同|channels are different"]),
+    ("append_missing_track", [r"没有轨道可以追加到该轨道|there is no track to append", r"--append-to.+(?:无效|invalid)"]),
+    ("append_track_mismatch", [r"无法追加到|cannot (?:append|be appended to)"]),
+]
+MKVMERGE_BENIGN_WARNING_PATTERNS = [
+    re.compile(r"无效数据.*跳过处理.*(?:不同步|音频/视频可能发生不同步)", re.IGNORECASE),
+    re.compile(r"invalid data.*skipping.*(?:out of sync|audio/video may be desynchronized)", re.IGNORECASE),
+]
+MAKEMKV_TINFO_PATTERN = re.compile(r'^TINFO:(\d+),(\d+),\d+,"(.*)"$')
 
 
 # ==============================================================================
@@ -363,6 +377,41 @@ def debug_print(message: str, console: Optional[Console] = None) -> None:
         output_console.print(message)
 
 
+def _format_track_debug(track: "Track") -> str:
+    return (
+        f"{track.display_id} type={track.type} lang={track.language} "
+        f"codec={track.codec or '-'} channels={track.channels or '-'} "
+        f"name={track.name or '-'} pid={track.source_pid_hex or track.source_pid or '-'} "
+        f"hidden={'yes' if getattr(track, 'is_hidden', False) else 'no'}"
+    )
+
+
+def _is_effectively_hidden_track(track: "Track") -> bool:
+    """统一判定轨道是否应视为隐藏轨。"""
+    return bool(getattr(track, "is_hidden", False)) or getattr(track, "source_hidden_hint", False) is True
+
+
+def _format_parsed_track_debug(parsed_track: Dict[str, Any]) -> str:
+    return (
+        f"src{parsed_track.get('source_id')} type={parsed_track.get('type')} "
+        f"lang={parsed_track.get('language', 'und')} ext={parsed_track.get('ext', '-')} "
+        f"channels={parsed_track.get('channels') or '-'} hidden={'yes' if parsed_track.get('is_hidden') else 'no'} "
+        f"desc={parsed_track.get('description') or '-'}"
+    )
+
+
+def _debug_dump_track_debug_list(label: str, tracks: List["Track"], console: Optional[Console] = None) -> None:
+    debug_print(f"[cyan][debug] {label}: count={len(tracks)}[/cyan]", console)
+    for index, track in enumerate(tracks, start=1):
+        debug_print(f"[dim][debug]   {index}. {_format_track_debug(track)}[/dim]", console)
+
+
+def _debug_dump_parsed_track_debug_list(label: str, parsed_tracks: List[Dict[str, Any]], console: Optional[Console] = None) -> None:
+    debug_print(f"[cyan][debug] {label}: count={len(parsed_tracks)}[/cyan]", console)
+    for index, parsed_track in enumerate(parsed_tracks, start=1):
+        debug_print(f"[dim][debug]   {index}. {_format_parsed_track_debug(parsed_track)}[/dim]", console)
+
+
 def _clean_channels_str(raw: str) -> str:
     """
     清理 BDInfo 声道字符串：去除 objects/Atmos/X 标识，保留基础声道描述
@@ -428,26 +477,33 @@ def _parse_tri_state(value: str, true_val: str, ask_val: str = "ask") -> Optiona
     return False
 
 
-def clean_path(path_str: str) -> str:
-    """
-    清理路径字符串：移除末尾的引号和多余的路径分隔符
+TOOL_PROBE_ARGS = {
+    "mkvmerge": ["--version"],
+    "ffprobe": ["-version"],
+    "MakeMKV": [],
+}
 
-    解决 Windows 命令行中 'path\' 导致的引号转义问题。
+
+def clean_path(path_str: str) -> Path:
+    """
+    清理命令行路径参数，并交给 pathlib 做规范化。
+
+    只剥离两端空白与外围引号，不手动裁剪路径分隔符，
+    避免把 Windows 根路径 `C:\\` 错误处理成 `C:`。
 
     Args:
         path_str: 原始路径字符串
 
     Returns:
-        清理后的路径字符串
+        清理后的 Path 对象
 
     Examples:
-        'G:\\Movie\\BDMV"' -> 'G:\\Movie\\BDMV'
-        'G:\\Movie\\BDMV\\' -> 'G:\\Movie\\BDMV'
-        'G:/Movie/BDMV/' -> 'G:/Movie/BDMV'
+        '"G:\\Movie\\BDMV"' -> Path("G:/Movie/BDMV")
+        'G:\\Movie\\BDMV\\' -> Path("G:/Movie/BDMV")
+        '"C:/"' -> Path("C:/")
     """
-    # 移除两端空格和引号，然后使用 pathlib 规范化路径
-    cleaned = path_str.strip().strip("\"'").rstrip("\\/")
-    return str(Path(cleaned))
+    cleaned = path_str.strip().strip("\"'")
+    return Path(cleaned).expanduser()
 
 
 def get_language_display_name(lang_code: str, fallback_to_english: bool = False) -> str:
@@ -547,6 +603,7 @@ def normalize_match_language(lang_code: str) -> str:
     return normalize_language_code(lang_code, "alpha_3")
 
 
+@lru_cache(maxsize=64)
 def find_executable(tool_name: str) -> Optional[str]:
     """
     查找可执行文件路径
@@ -569,76 +626,240 @@ def find_executable(tool_name: str) -> Optional[str]:
     return shutil.which(tool_name)
 
 
-def check_tools() -> None:
-    """检查必需工具是否可用"""
-    console = Console()
+def get_makemkv_profile_path() -> Optional[Path]:
+    """返回 MakeMKV profile 配置文件路径。"""
+    profile_path = CUSTOM_PATHS.get("MakeMKVProfile", "")
+    if not profile_path:
+        return None
+    path = Path(profile_path)
+    return path if path.is_file() else None
 
-    required = {
-        "mkvmerge": "mkvmerge",
-        "ffprobe": "ffprobe",
-    }
-    version_args = {
-        "mkvmerge": ["--version"],
-        "ffprobe": ["-version"],
-    }
 
-    missing_required = []
-    no_permission_required = []
-    broken_required = []
+def _probe_single_tool(tool_name: str) -> Tuple[str, Optional[str]]:
+    """检查单个工具的存在性、执行权限与可选可运行性。"""
+    tool_path = find_executable(tool_name)
+    if not tool_path:
+        return "missing", None
 
-    for tool, name in required.items():
-        tool_path = find_executable(tool)
-        if not tool_path:
-            missing_required.append(name)
-            continue
+    if not sys.platform.startswith("win") and not os.access(tool_path, os.X_OK):
+        return "permission", tool_path
 
-        if not sys.platform.startswith("win") and not os.access(tool_path, os.X_OK):
-            no_permission_required.append(tool_path)
-            continue
+    probe_args = TOOL_PROBE_ARGS.get(tool_name)
+    if not probe_args:
+        return "ok", tool_path
 
-        try:
-            result = subprocess.run(
-                [tool_path, *version_args[tool]],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-            tool_status = "ok" if result.returncode == 0 else "broken"
-        except PermissionError:
-            tool_status = "permission"
-        except (OSError, subprocess.SubprocessError):
-            tool_status = "broken"
+    try:
+        result = subprocess.run(
+            [tool_path, *probe_args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+            creationflags=NO_WINDOW_CREATION_FLAGS,
+        )
+        return ("ok", tool_path) if result.returncode == 0 else ("broken", tool_path)
+    except PermissionError:
+        return "permission", tool_path
+    except (OSError, subprocess.SubprocessError):
+        return "broken", tool_path
 
-        if tool_status == "permission":
-            no_permission_required.append(tool_path)
-        elif tool_status == "broken":
-            broken_required.append(name)
 
-    if missing_required:
-        console.print(f"[red]错误：缺少必需工具 - {', '.join(missing_required)}[/red]")
+def _collect_tool_status(tool_names: List[str]) -> Dict[str, List[str]]:
+    """批量收集工具状态，供启动检查与按需检查复用。"""
+    statuses = {"missing": [], "permission": [], "broken": []}
+    for tool_name in tool_names:
+        status, tool_path = _probe_single_tool(tool_name)
+        if status == "missing":
+            statuses["missing"].append(tool_name)
+        elif status == "permission" and tool_path:
+            statuses["permission"].append(tool_path)
+        elif status == "broken":
+            statuses["broken"].append(tool_name)
+    return statuses
+
+
+def _tool_status_has_error(statuses: Dict[str, List[str]]) -> bool:
+    return any(statuses.values())
+
+
+def _print_tool_status_errors(console: Console, statuses: Dict[str, List[str]], context_label: str) -> None:
+    if statuses["missing"]:
+        console.print(f"[red]错误：{context_label}缺少工具 - {', '.join(statuses['missing'])}[/red]")
         console.print("请确保对应可执行文件已安装，并且位于 CUSTOM_PATHS、脚本目录或系统 PATH 中")
-        sys.exit(1)
 
-    if no_permission_required:
+    if statuses["permission"]:
         console.print("[red]错误：以下工具缺少执行权限[/red]")
-        for tool_path in no_permission_required:
+        for tool_path in statuses["permission"]:
             console.print(f"  - {tool_path}")
         if not sys.platform.startswith("win"):
             console.print("[yellow]请使用下面的命令授予执行权限：[/yellow]")
-            for tool_path in no_permission_required:
+            for tool_path in statuses["permission"]:
                 console.print(f"chmod +x {shlex.quote(tool_path)}")
         else:
             console.print("[yellow]请检查文件权限、来源限制或安全软件拦截。[/yellow]")
-        sys.exit(1)
 
-    if broken_required:
-        console.print(f"[red]错误：以下必需工具存在但无法正常运行 - {', '.join(broken_required)}[/red]")
+    if statuses["broken"]:
+        console.print(f"[red]错误：以下工具存在但无法正常运行 - {', '.join(statuses['broken'])}[/red]")
         console.print("请检查工具文件是否损坏、依赖是否完整，或路径是否指向了错误的可执行文件")
-        sys.exit(1)
 
+
+def check_tools() -> None:
+    """检查必需工具是否可用。"""
+    console = Console()
+    statuses = _collect_tool_status(["mkvmerge", "ffprobe"])
+    if _tool_status_has_error(statuses):
+        _print_tool_status_errors(console, statuses, "必需")
+        sys.exit(1)
     console.print("[green]✓ 工具链检查通过[/green]")
+
+
+def require_tools(tool_names: List[str], console: Optional[Console] = None) -> None:
+    """按需检查工具状态，用于特殊处理路径。"""
+    console = console or Console()
+    statuses = _collect_tool_status(tool_names)
+    if _tool_status_has_error(statuses):
+        _print_tool_status_errors(console, statuses, "当前处理路径")
+        missing_parts = statuses["missing"] + statuses["broken"]
+        if statuses["permission"]:
+            missing_parts.extend(Path(path).name for path in statuses["permission"])
+        raise RuntimeError(f"工具不可用：{', '.join(missing_parts)}")
+
+
+def _mkvmerge_identify_has_video_track(output: str) -> bool:
+    """判断 mkvmerge -i 输出是否包含视频轨。"""
+    return bool(MKVMERGE_VIDEO_TRACK_PATTERN.search(output or ""))
+
+
+def _strip_known_benign_mkvmerge_warnings(output: str) -> str:
+    """移除会干扰问题盘判定的已知非致命警告行。"""
+    kept_lines: List[str] = []
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if any(pattern.search(line) for pattern in MKVMERGE_BENIGN_WARNING_PATTERNS):
+            continue
+        kept_lines.append(raw_line)
+    return "\n".join(kept_lines)
+
+
+def classify_problem_disc_error(output: str) -> Optional[str]:
+    """识别多段盘原始直封失败是否属于已知问题盘特征。"""
+    normalized = _strip_known_benign_mkvmerge_warnings(output or "")
+    for reason, patterns in PROBLEM_DISC_ERROR_PATTERNS:
+        if all(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns):
+            return reason
+    return None
+
+
+def select_candidate_index_by_bdinfo_playlist(candidates: List[Dict], playlist_name: Optional[str]) -> Optional[int]:
+    """根据 BDInfo PLAYLIST 精确匹配候选 MPLS。"""
+    if not playlist_name:
+        return None
+
+    target = playlist_name.lower()
+    for idx, candidate in enumerate(candidates):
+        if candidate.get("mpls_name", "").lower() == target:
+            return idx
+    return None
+
+
+def _extract_bdinfo_playlist_name(bdinfo_path: Optional[Path]) -> Optional[str]:
+    """仅提取 BDInfo PLAYLIST，用于候选标记与自动选片。"""
+    if not bdinfo_path or not bdinfo_path.exists():
+        return None
+
+    try:
+        parser = BDInfoParser(str(bdinfo_path))
+        return parser.parse().get("playlist")
+    except Exception:
+        return None
+
+
+def _write_inline_progress(message: str) -> None:
+    sys.stdout.write("\r" + message)
+    sys.stdout.flush()
+
+
+def _finish_inline_progress() -> None:
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def probe_multi_segment_video_tracks(stream_dir: Path, segment_names: List[str], console: Console) -> Tuple[bool, Optional[str]]:
+    """
+    站在 mkvmerge 视角做多段盘准入检测：
+    对每个分段执行 mkvmerge -i，只判断是否识别到视频轨。
+    """
+    mkvmerge = find_executable("mkvmerge") or "mkvmerge"
+    has_inline_progress = False
+    console.print(f"[cyan]检测到多段播放列表，共 {len(segment_names)} 段；执行预检查...[/cyan]")
+    console.print("[dim]预检查规则：仅检查 mkvmerge 是否能识别每段视频轨[/dim]")
+
+    for index, segment_name in enumerate(segment_names, start=1):
+        segment_path = stream_dir / f"{segment_name}.m2ts"
+        if not segment_path.exists():
+            if has_inline_progress:
+                _finish_inline_progress()
+            reason = f"分段文件不存在：{segment_path.name}"
+            console.print(f"[red]  分段 {index}/{len(segment_names)}: {reason}[/red]")
+            return False, reason
+
+        result = subprocess.run(
+            [mkvmerge, "-i", str(segment_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            creationflags=NO_WINDOW_CREATION_FLAGS,
+        )
+        identify_output = (result.stdout or "") + (result.stderr or "")
+        has_video = result.returncode == 0 and _mkvmerge_identify_has_video_track(identify_output)
+
+        if has_video:
+            _write_inline_progress(f"  分段 {index}/{len(segment_names)}: {segment_path.name} 可识别视频轨")
+            has_inline_progress = True
+            if index == len(segment_names):
+                _finish_inline_progress()
+            continue
+
+        if has_inline_progress:
+            _finish_inline_progress()
+        reason = f"分段 {segment_path.name} 无法被 mkvmerge 识别出视频轨"
+        console.print(f"[red]  分段 {index}/{len(segment_names)}: {reason}[/red]")
+        return False, reason
+
+    console.print("[green]预检查完成：所有分段均可识别视频轨，允许继续原流程。[/green]")
+    return True, None
+
+
+def resolve_processing_mode(chapter: "Chapter", console: Console) -> Dict[str, Any]:
+    """根据分段数与预检查结果决定处理路径。"""
+    segment_names = chapter.get_m2ts_files()
+    segment_count = len(segment_names)
+    is_multi_segment = segment_count >= 2
+    decision = {
+        "segment_count": segment_count,
+        "is_multi_segment": is_multi_segment,
+        "is_problem_disc": False,
+        "problem_reason": None,
+        "processing_mode": "direct",
+    }
+
+    if not is_multi_segment:
+        console.print("[green]检测到单段播放列表；跳过分段检测，继续原流程。[/green]")
+        return decision
+
+    stream_dir = Path(chapter.file_path).parent.parent / "STREAM"
+    passed, reason = probe_multi_segment_video_tracks(stream_dir, segment_names, console)
+    if not passed:
+        decision["is_problem_disc"] = True
+        decision["problem_reason"] = reason
+        decision["processing_mode"] = "problem_fallback"
+        console.print(f"[yellow]当前原盘已标记为问题盘：{reason}[/yellow]")
+        return decision
+
+    console.print("[cyan]当前原盘将继续使用多段盘原始直封路径。[/cyan]")
+    return decision
 
 
 def get_display_width(text: str) -> int:
@@ -1062,81 +1283,6 @@ class Chapter:
                         f.read(stream_attributes_length - 1)
 
                 break  # 只解析第一个 PlayItem
-
-
-class M2TS:
-    """M2TS 文件分析类"""
-
-    def __init__(self, filename: str):
-        self.filename = filename
-        self.frame_size = 192
-
-    def get_duration(self) -> int:
-        """获取时长（90kHz 单位）"""
-        try:
-            with open(self.filename, "rb") as f:
-                self.m2ts_file = f
-
-                # 查找第一个 PCR
-                buffer_size = 256 * 1024
-                buffer_size -= buffer_size % self.frame_size
-                cur_pos = 0
-                first_pcr_val = -1
-
-                while cur_pos < buffer_size:
-                    f.read(7)
-                    first_pcr_val = self._get_pcr_val()
-                    f.read(182)
-                    cur_pos += self.frame_size
-                    if first_pcr_val != -1:
-                        break
-
-                # 查找最后一个 PCR
-                buffer_size = 256 * 1024
-                last_pcr_val = self._get_last_pcr_val(buffer_size)
-
-                while last_pcr_val == -1 and buffer_size <= 1024 * 1024:
-                    buffer_size *= 4
-                    last_pcr_val = self._get_last_pcr_val(buffer_size)
-
-                return 0 if last_pcr_val == -1 else last_pcr_val - first_pcr_val
-
-        except Exception:
-            return 0
-
-    def _get_last_pcr_val(self, buffer_size: int) -> int:
-        """从文件末尾查找最后一个 PCR"""
-        last_pcr_val = -1
-        file_size = Path(self.filename).stat().st_size
-        cur_pos = max(file_size - file_size % self.frame_size - buffer_size, 0)
-        buffer_end = cur_pos + buffer_size
-
-        while cur_pos <= buffer_end - self.frame_size:
-            self.m2ts_file.seek(cur_pos + 7)
-            _last_pcr_val = self._get_pcr_val()
-            if _last_pcr_val != -1:
-                last_pcr_val = _last_pcr_val
-            cur_pos += self.frame_size
-
-        return last_pcr_val
-
-    def _unpack_bytes(self, n: int) -> int:
-        formats = {1: ">B", 2: ">H", 4: ">I", 8: ">Q"}
-        return unpack(formats[n], self.m2ts_file.read(n))[0]
-
-    def _get_pcr_val(self) -> int:
-        """读取 PCR 值"""
-        af_exists = (self._unpack_bytes(1) >> 5) % 2
-        adaptive_field_length = self._unpack_bytes(1)
-        pcr_exist = (self._unpack_bytes(1) >> 4) % 2
-
-        if af_exists and adaptive_field_length and pcr_exist:
-            tmp = [self._unpack_bytes(1) for _ in range(4)]
-            pcr = tmp[3] + (tmp[2] << 8) + (tmp[1] << 16) + (tmp[0] << 24)
-            pcr_lo = self._unpack_bytes(1) >> 7
-            return (pcr << 1) + pcr_lo
-
-        return -1
 
 
 # ==============================================================================
@@ -1569,6 +1715,10 @@ class Track:
         self.bdinfo_checked = False  # 是否已尝试匹配 BDInfo
         self.matched_bdinfo = False  # 是否成功匹配到 BDInfo
         self.is_hidden = False  # 是否为 BDInfo 标记的隐藏轨
+        self.source_pid = 0
+        self.source_pid_hex = ""
+        self.source_hidden_hint: Optional[bool] = None
+        self.mkvmerge_sync_ms: Optional[int] = None
 
     @property
     def display_id(self) -> str:
@@ -1676,32 +1826,33 @@ class Track:
 
         return f"Track {self.id}"
 
-    def to_mkvmerge_args(self) -> List[str]:
+    def to_mkvmerge_args(self, track_id: Optional[int] = None) -> List[str]:
         """生成 mkvmerge 参数"""
         args = []
+        track_id = self.id if track_id is None else track_id
 
         # 语言（使用 pycountry 转换为 BCP 47）
         lang_code = get_language_tag(self.language, self.type)
-        args.extend(["--language", f"{self.id}:{lang_code}"])
+        args.extend(["--language", f"{track_id}:{lang_code}"])
 
         # 轨道名（视频轨保持原始名称，不设置）
         if self.name and self.type != "video":
-            args.extend(["--track-name", f"{self.id}:{self.name}"])
+            args.extend(["--track-name", f"{track_id}:{self.name}"])
 
         # 默认标志
-        args.extend(["--default-track", f"{self.id}:{'1' if self.is_default else '0'}"])
+        args.extend(["--default-track", f"{track_id}:{'1' if self.is_default else '0'}"])
 
         # 评论轨标志
         if self.is_commentary:
-            args.extend(["--commentary-flag", f"{self.id}:1"])
+            args.extend(["--commentary-flag", f"{track_id}:1"])
 
         # 原语言标志
         if self.is_original:
-            args.extend(["--original-flag", f"{self.id}:1"])
+            args.extend(["--original-flag", f"{track_id}:1"])
 
         # SDH 听觉障碍标志
         if self.is_hearing_impaired:
-            args.extend(["--hearing-impaired-flag", f"{self.id}:1"])
+            args.extend(["--hearing-impaired-flag", f"{track_id}:1"])
 
         return args
 
@@ -2182,6 +2333,10 @@ def match_track_with_bdinfo(track: Track, bdinfo_tracks: List[Dict], used_indice
     for idx, bd_track in enumerate(bdinfo_tracks):
         if idx in used_indices:
             continue  # 已被匹配，跳过
+
+        hidden_hint = track.source_hidden_hint
+        if hidden_hint is not None and bool(bd_track.get("is_hidden", False)) != hidden_hint:
+            continue
 
         # 语言匹配
         bd_lang = bd_track.get("language", "und")
@@ -3016,7 +3171,8 @@ class InteractiveCLI:
         self.console.print("[dim]  - 范围匹配：d S7-S10[/dim]")
         self.console.print("[dim]  - 组合使用：lang S1,S3-S5 zh-Hans[/dim]")
         self.console.print("[dim]  - 切换默认：default S1,S2（已默认则取消）[/dim]\n")
-        self.console.print("[dim]标记说明：* 表示 BDInfo 隐藏轨，× 表示当前未在工作集合中的轨道[/dim]\n")
+        self.console.print("[dim]标记说明：* 表示 BDInfo 隐藏轨，× 表示当前未在工作集合中的轨道[/dim]")
+        self.console.print("[dim]问题盘（MakeMKV 路径）会自动忽略隐藏轨；即使手动 add 回来，也不会参与后续回绑与封装。[/dim]\n")
 
         while True:
             self.console.print()
@@ -3261,7 +3417,13 @@ class InteractiveCLI:
 
         return same_type_tracks[index]
 
-    def select_from_candidates(self, candidates: List[Dict], prompt: str, auto_skip: bool = True) -> int:
+    def select_from_candidates(
+        self,
+        candidates: List[Dict],
+        prompt: str,
+        auto_skip: bool = True,
+        bdinfo_playlist: Optional[str] = None,
+    ) -> int:
         """从候选列表中选择"""
         if not candidates:
             return -1
@@ -3278,10 +3440,15 @@ class InteractiveCLI:
         table.add_column("章节", width=6, justify="right")
         table.add_column("M2TS文件", width=20)
 
+        bdinfo_playlist_lower = (bdinfo_playlist or "").strip().lower()
+
         for i, cand in enumerate(candidates):
+            is_bdinfo_match = bool(bdinfo_playlist_lower and cand.get("mpls_name", "").lower() == bdinfo_playlist_lower)
+            mpls_name = cand.get("mpls_name", "")
+            mpls_cell = f"{mpls_name} ★" if is_bdinfo_match else mpls_name
             table.add_row(
                 str(i + 1),
-                cand.get("mpls_name", ""),
+                mpls_cell,
                 format_duration(cand.get("duration", 0)),
                 format_size(cand.get("size", 0)),
                 str(cand.get("chapters", 0)),
@@ -3289,6 +3456,8 @@ class InteractiveCLI:
             )
 
         self.console.print(table)
+        if bdinfo_playlist:
+            self.console.print(f"[dim]注：MPLS 文件名后缀 ★ 表示与 BDInfo PLAYLIST ({bdinfo_playlist}) 一致的候选。[/dim]")
 
         # 用户选择
         while True:
@@ -3364,28 +3533,41 @@ def extract_metadata(bdmv_path: Path) -> Dict:
     return metadata
 
 
-def generate_ogm_chapters(chapter: Chapter, output_path: str) -> str:
-    """生成 OGM 格式的章节文件"""
-    timestamps = chapter.get_chapter_timestamps()
+def _format_ogm_chapter_timestamp(ts: float) -> str:
+    minutes, seconds = divmod(ts, 60)
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
 
+
+def _write_ogm_chapter_entries(entries: List[Tuple[float, str]], output_path: Path) -> None:
+    chapter_lines = []
+    for i, (ts, name) in enumerate(entries, start=1):
+        chapter_lines.append(f"CHAPTER{i:02d}={_format_ogm_chapter_timestamp(ts)}")
+        chapter_lines.append(f"CHAPTER{i:02d}NAME={name}")
+
+    output_path.write_text("\n".join(chapter_lines), encoding="utf-8")
+
+
+def generate_ogm_chapters_from_timestamps(timestamps: List[float], output_path: str) -> Optional[str]:
+    """根据时间戳列表生成 OGM 格式章节文件。"""
     if not timestamps:
         return None
-
-    chapter_lines = []
-    for i, ts in enumerate(timestamps, start=1):
-        minutes, seconds = divmod(ts, 60)
-        hours, minutes = divmod(int(minutes), 60)
-
-        # OGM 格式：CHAPTER01=00:00:00.000
-        time_str = f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
-        chapter_lines.append(f"CHAPTER{i:02d}={time_str}")
-        chapter_lines.append(f"CHAPTER{i:02d}NAME=Chapter {i:02d}")
-
-    # 写入临时章节文件
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(chapter_lines))
-
+    entries = [(ts, f"Chapter {i:02d}") for i, ts in enumerate(timestamps, start=1)]
+    _write_ogm_chapter_entries(entries, Path(output_path))
     return output_path
+
+
+def get_segment_boundary_timestamps(chapter: Chapter) -> List[float]:
+    """基于 MPLS 分段边界生成章节时间戳（包含 00:00:00）。"""
+    timestamps: List[float] = [0.0]
+    offset = 0.0
+    last_ts = 0.0
+    for index, (_, in_time, out_time) in enumerate(chapter.in_out_time):
+        if index > 0 and offset - last_ts >= 1.0:
+            timestamps.append(offset)
+            last_ts = offset
+        offset += (out_time - in_time) / 45000
+    return timestamps
 
 
 def find_bdmv_in_mount(mount_point: Path) -> Path:
@@ -3437,59 +3619,59 @@ def guess_attachment_mime_type(path: Path) -> str:
 def build_mkvmerge_command(
     output_path: str, mpls_path: str, tracks: List[Track], title: str, cover_path: Optional[Path] = None, chapters_file: Optional[str] = None
 ) -> List[str]:
-    """
-    构建 mkvmerge 命令
-
-    Args:
-        output_path: 输出文件路径
-        mpls_path: MPLS 文件路径
-        tracks: 轨道列表
-        title: MKV 标题
-        cover_path: 封面路径（可选）
-        chapters_file: 章节文件路径（可选）
-
-    Returns:
-        mkvmerge 命令参数列表
-    """
+    """构建基于播放列表输入的 mkvmerge 命令。"""
     cmd = [find_executable("mkvmerge") or "mkvmerge", "-o", output_path]
+    _append_mkvmerge_title_and_chapters(cmd, title, chapters_file)
+    _append_mkvmerge_track_selection(cmd, tracks)
 
-    # 标题
-    if title:
-        cmd.extend(["--title", title])
-
-    # 章节
-    if chapters_file and Path(chapters_file).exists():
-        cmd.extend(["--chapters", chapters_file])
-
-    # 轨道选择
-    video_ids = sorted(t.id for t in tracks if t.type == "video")
-    audio_ids = sorted(t.id for t in tracks if t.type == "audio")
-    subtitle_ids = sorted(t.id for t in tracks if t.type == "subtitle")
-
-    if video_ids:
-        cmd.extend(["--video-tracks", ",".join(str(id) for id in video_ids)])
-    else:
-        cmd.append("--no-video")
-
-    if audio_ids:
-        cmd.extend(["--audio-tracks", ",".join(str(id) for id in audio_ids)])
-    else:
-        cmd.append("--no-audio")
-
-    if subtitle_ids:
-        cmd.extend(["--subtitle-tracks", ",".join(str(id) for id in subtitle_ids)])
-    else:
-        cmd.append("--no-subtitles")
-
-    # 轨道排序（明确指定顺序）
     track_order = ",".join(f"0:{t.id}" for t in tracks)
     cmd.extend(["--track-order", track_order])
 
-    # 轨道属性
     for track in tracks:
-        cmd.extend(track.to_mkvmerge_args())
+        _append_mkvmerge_track_args(cmd, track, track.id, track.mkvmerge_sync_ms)
 
-    # 封面附件
+    _append_mkvmerge_cover_attachment(cmd, cover_path)
+
+    cmd.append(mpls_path)
+    return cmd
+
+
+def _append_mkvmerge_title_and_chapters(cmd: List[str], title: str, chapters_file: Optional[str]) -> None:
+    """追加标题与章节参数。"""
+    if title:
+        cmd.extend(["--title", title])
+    if chapters_file and Path(chapters_file).exists():
+        cmd.extend(["--chapters", chapters_file])
+
+
+def _append_mkvmerge_track_selection_with_resolver(cmd: List[str], tracks: List[Track], track_id_resolver: Callable[[Track], int]) -> None:
+    """追加视频/音频/字幕轨筛选参数，轨道 ID 由 resolver 决定。"""
+    for track_type, option, no_option in (
+        ("video", "--video-tracks", "--no-video"),
+        ("audio", "--audio-tracks", "--no-audio"),
+        ("subtitle", "--subtitle-tracks", "--no-subtitles"),
+    ):
+        track_ids = sorted(track_id_resolver(track) for track in tracks if track.type == track_type)
+        if track_ids:
+            cmd.extend([option, ",".join(str(track_id) for track_id in track_ids)])
+        else:
+            cmd.append(no_option)
+
+
+def _append_mkvmerge_track_selection(cmd: List[str], tracks: List[Track]) -> None:
+    """追加视频/音频/字幕轨筛选参数。"""
+    _append_mkvmerge_track_selection_with_resolver(cmd, tracks, lambda track: track.id)
+
+
+def _append_mkvmerge_track_args(cmd: List[str], track: Track, track_id: int, sync_ms: Optional[int]) -> None:
+    """追加单条轨道的属性参数与同步参数。"""
+    cmd.extend(track.to_mkvmerge_args(track_id=track_id))
+    if sync_ms not in (None, 0):
+        cmd.extend(["--sync", f"{track_id}:{sync_ms}"])
+
+
+def _append_mkvmerge_cover_attachment(cmd: List[str], cover_path: Optional[Path]) -> None:
+    """追加封面附件参数。"""
     if cover_path and cover_path.exists():
         cmd.extend(
             [
@@ -3502,12 +3684,527 @@ def build_mkvmerge_command(
             ]
         )
 
-    cmd.append(mpls_path)
+
+def parse_makemkv_tinfo(output: str) -> Dict[int, Dict[int, str]]:
+    """解析 MakeMKV `-r info` 输出中的 TINFO 字段。"""
+    title_info: Dict[int, Dict[int, str]] = {}
+    for raw_line in (output or "").splitlines():
+        match = MAKEMKV_TINFO_PATTERN.match(raw_line.strip())
+        if not match:
+            continue
+        title_id = int(match.group(1))
+        field_code = int(match.group(2))
+        value = match.group(3)
+        title_info.setdefault(title_id, {})[field_code] = value
+    return title_info
+
+
+def select_makemkv_title_by_playlist(tinfo: Dict[int, Dict[int, str]], mpls_path: Path) -> int:
+    """基于 TINFO:16（playlist）选择目标 title。"""
+    target_playlist = mpls_path.name.lower()
+    for title_id, fields in sorted(tinfo.items()):
+        playlist_name = (fields.get(16) or "").strip().lower()
+        if playlist_name == target_playlist:
+            return title_id
+
+    available = [fields.get(16, f"title#{title_id}") for title_id, fields in sorted(tinfo.items()) if fields.get(16)]
+    raise RuntimeError(f"MakeMKV info 未找到与播放列表匹配的标题：target={mpls_path.name} " f"available={available or 'none'}（必须依赖 TINFO:16）")
+
+
+def _resolve_disc_root_from_mpls(mpls_path: Path) -> Path:
+    """根据 `.../BDMV/PLAYLIST/*.mpls` 推导光盘根目录。"""
+    bdmv_dir = mpls_path.parent.parent
+    if bdmv_dir.name.upper() != "BDMV":
+        raise RuntimeError(f"无法从 MPLS 路径推导 BDMV 根目录：{mpls_path}")
+    return bdmv_dir.parent
+
+
+def run_makemkv_info_with_robot(disc_root: Path, console: Optional[Console] = None) -> str:
+    """执行 `makemkvcon -r info` 并返回输出文本（静默模式，仅打印开始/完成）。"""
+    require_tools(["MakeMKV"])
+    console = console or Console()
+    makemkv = find_executable("MakeMKV") or "makemkvcon"
+    cmd = [makemkv, "-r", "info", f"file:{disc_root}"]
+    console.print("[cyan]MakeMKV 正在读取原盘信息（-r info）...[/cyan]")
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        creationflags=NO_WINDOW_CREATION_FLAGS,
+    )
+    output_text = (result.stdout or "") + (result.stderr or "")
+    if result.returncode != 0:
+        raise RuntimeError(f"MakeMKV 读取原盘信息失败：{output_text}")
+    console.print("[green]MakeMKV 原盘信息读取完成[/green]")
+    return output_text
+
+
+def _resolve_makemkv_title_output(output_dir: Path, title_id: int) -> Path:
+    """定位 MakeMKV 导出的目标 MKV 文件。"""
+    mkv_files = sorted(path for path in output_dir.glob("*.mkv") if path.is_file())
+    if not mkv_files:
+        raise RuntimeError(f"MakeMKV 未生成任何 MKV：{output_dir}")
+
+    expected_suffix = f"_t{title_id:02d}.mkv"
+    expected_matches = [path for path in mkv_files if path.name.lower().endswith(expected_suffix.lower())]
+    if len(expected_matches) == 1:
+        return expected_matches[0]
+
+    if len(mkv_files) == 1:
+        return mkv_files[0]
+
+    # MakeMKV 特殊场景可能生成额外文件；优先保留最大体积文件作为主标题。
+    return max(mkv_files, key=lambda path: path.stat().st_size)
+
+
+def run_makemkv_title_extract(
+    disc_root: Path,
+    title_id: int,
+    output_dir: Path,
+    console: Console,
+    profile_path: Optional[Path] = None,
+) -> Path:
+    """执行 MakeMKV 单标题导出并返回输出 MKV 路径。"""
+    require_tools(["MakeMKV"])
+    makemkv = find_executable("MakeMKV") or "makemkvcon"
+    cmd = [makemkv]
+    if profile_path:
+        cmd.append(f"--profile={profile_path}")
+    cmd.extend(["mkv", f"file:{disc_root}", str(title_id), str(output_dir)])
+
+    returncode, output_text = _run_command_with_status(
+        cmd,
+        console,
+        f"MakeMKV 正在导出标题 #{title_id}...",
+        f"MakeMKV 导出标题 #{title_id} 完成",
+    )
+    if returncode != 0:
+        raise RuntimeError(f"MakeMKV 导出失败：{output_text}")
+    return _resolve_makemkv_title_output(output_dir, title_id)
+
+
+def _normalize_channel_value(raw: Any) -> str:
+    """统一声道文本，用于候选轨道评分。"""
+    if raw in (None, ""):
+        return ""
+    text = str(raw).strip()
+    if text.isdigit():
+        return _CHANNEL_MAP.get(int(text), f"{text}ch")
+    return _clean_channels_str(text)
+
+
+def _classify_source_audio_codec(track: "Track") -> str:
+    codec = (track.codec or "").lower()
+    if codec in {"dts_x", "dts_hd_ma", "dts_hd"}:
+        return "dts_hd"
+    if codec in {"dts"}:
+        return "dts"
+    if codec in {"truehd"}:
+        return "truehd"
+    if codec in {"ac3", "eac3"}:
+        return "ac3"
+    if codec in {"lpcm"}:
+        return "lpcm"
+    return codec or "unknown"
+
+
+def _classify_temp_audio_codec(codec_name: str) -> str:
+    codec = (codec_name or "").lower()
+    if "truehd" in codec:
+        return "truehd"
+    if "dts-hd" in codec or "dts hd" in codec:
+        return "dts_hd"
+    if "dts" in codec:
+        return "dts"
+    if "e-ac-3" in codec or "eac3" in codec:
+        return "ac3"
+    if "ac-3" in codec or "ac3" in codec:
+        return "ac3"
+    if "pcm" in codec:
+        return "lpcm"
+    return codec or "unknown"
+
+
+def _is_temp_track_compatible(source_track: "Track", temp_track: Dict[str, Any]) -> bool:
+    """判断临时 MKV 轨道是否可用于回绑指定源轨道。"""
+    if source_track.type != temp_track.get("type"):
+        return False
+
+    if source_track.type == "video":
+        return True
+
+    if source_track.type == "subtitle":
+        source_codec = (source_track.codec or "").lower()
+        temp_codec = (temp_track.get("codec") or "").lower()
+        if source_codec in {"", "pgs", "hdmv_pgs_subtitle"}:
+            return "pgs" in temp_codec
+        return source_codec in temp_codec
+
+    if source_track.type == "audio":
+        source_codec_class = _classify_source_audio_codec(source_track)
+        temp_codec_class = _classify_temp_audio_codec(temp_track.get("codec", ""))
+        if source_codec_class == "dts_hd":
+            return temp_codec_class == "dts_hd"
+        if source_codec_class == "dts":
+            return temp_codec_class == "dts"
+        if source_codec_class == "truehd":
+            return temp_codec_class == "truehd"
+        if source_codec_class == "ac3":
+            return temp_codec_class == "ac3"
+        if source_codec_class == "lpcm":
+            return temp_codec_class == "lpcm"
+        return True
+
+    return False
+
+
+def _score_temp_track_candidate(source_track: "Track", temp_track: Dict[str, Any]) -> int:
+    """候选评分：同 PID > 语言匹配 > 声道匹配 > 轨道序。"""
+    score = 0
+    if source_track.source_pid and temp_track.get("source_id") == source_track.source_pid:
+        score += 1000
+
+    source_lang = normalize_match_language(source_track.language)
+    temp_lang = normalize_match_language(temp_track.get("language", "und"))
+    if source_lang == temp_lang:
+        score += 100
+
+    if source_track.type == "audio":
+        source_channels = _normalize_channel_value(source_track.channels)
+        temp_channels = _normalize_channel_value(temp_track.get("channels"))
+        if source_channels and temp_channels and source_channels == temp_channels:
+            score += 10
+
+    # 轨道 ID 越小优先，保证稳定性。
+    score += max(0, 100 - int(temp_track.get("id", 0)))
+    return score
+
+
+def _format_temp_track_debug(temp_track: Dict[str, Any]) -> str:
+    source_id = temp_track.get("source_id")
+    source_hex = f"{source_id:04X}" if isinstance(source_id, int) else "-"
+    return (
+        f"tid={temp_track.get('id')} type={temp_track.get('type')} "
+        f"lang={temp_track.get('language', 'und')} codec={temp_track.get('codec', '-')} "
+        f"channels={temp_track.get('channels') or '-'} src_pid={source_hex}"
+    )
+
+
+def scan_temp_mkv_tracks(temp_mkv_path: Path) -> List[Dict[str, Any]]:
+    """使用 mkvmerge -J 读取临时 MKV 轨道信息。"""
+    require_tools(["mkvmerge"])
+    mkvmerge = find_executable("mkvmerge") or "mkvmerge"
+    result = subprocess.run(
+        [mkvmerge, "-J", str(temp_mkv_path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        creationflags=NO_WINDOW_CREATION_FLAGS,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"mkvmerge 读取临时 MKV 失败：{result.stdout or result.stderr}")
+
+    try:
+        payload = json.loads((result.stdout or "").replace("\x00", ""))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"临时 MKV 的 mkvmerge JSON 解析失败：{exc}") from exc
+
+    parsed_tracks: List[Dict[str, Any]] = []
+    for track in payload.get("tracks", []):
+        raw_type = track.get("type", "")
+        track_type = "subtitle" if raw_type == "subtitles" else raw_type
+        if track_type not in {"video", "audio", "subtitle"}:
+            continue
+
+        props = track.get("properties") or {}
+        source_hex = (props.get("tag_source_id") or "").strip()
+        source_id = None
+        if source_hex:
+            try:
+                source_id = int(source_hex, 16)
+            except ValueError:
+                source_id = None
+
+        parsed_tracks.append(
+            {
+                "id": int(track.get("id", -1)),
+                "type": track_type,
+                "codec": track.get("codec", ""),
+                "language": props.get("language", "und"),
+                "channels": props.get("audio_channels"),
+                "source_id": source_id,
+                "source_hex": source_hex.upper(),
+                "default_track": bool(props.get("default_track", False)),
+                "forced_track": bool(props.get("forced_track", False)),
+                "description": track.get("codec", ""),
+            }
+        )
+
+    return parsed_tracks
+
+
+def map_tracks_to_temp_mkv(
+    source_tracks: List[Track],
+    selected_tracks: List[Track],
+    temp_tracks: List[Dict[str, Any]],
+    temp_mkv_path: Path,
+) -> Dict[int, Dict[str, Any]]:
+    """将最终保留轨道回绑到临时 MKV 轨道 ID。"""
+    selected_by_id = {track.id: track for track in selected_tracks}
+    ordered_selected = [track for track in source_tracks if track.id in selected_by_id]
+    ordered_selected_ids = {track.id for track in ordered_selected}
+    ordered_selected.extend(track for track in selected_tracks if track.id not in ordered_selected_ids)
+
+    temp_by_type: Dict[str, List[Dict[str, Any]]] = {
+        track_type: sorted((track for track in temp_tracks if track.get("type") == track_type), key=lambda item: item.get("id", 0))
+        for track_type in ("video", "audio", "subtitle")
+    }
+
+    _debug_dump_track_debug_list("MakeMKV 待回绑 source 轨", ordered_selected)
+    _debug_dump_parsed_track_debug_list("MakeMKV 临时 MKV 轨", temp_tracks)
+
+    used_temp_ids: Set[int] = set()
+    track_sources: Dict[int, Dict[str, Any]] = {}
+    failures: List[str] = []
+
+    for source_track in ordered_selected:
+        candidates = [track for track in temp_by_type[source_track.type] if track["id"] not in used_temp_ids]
+        if source_track.source_pid:
+            pid_candidates = [track for track in candidates if track.get("source_id") == source_track.source_pid]
+            if source_track.type == "subtitle":
+                if not pid_candidates:
+                    failures.append(
+                        f"{source_track.display_id} type=subtitle pid={source_track.source_pid_hex or source_track.source_pid} "
+                        "在临时 MKV 中无同 PID 轨道，已拒绝降级匹配"
+                    )
+                    continue
+                candidates = pid_candidates
+            elif pid_candidates:
+                candidates = pid_candidates
+
+        compatible = [track for track in candidates if _is_temp_track_compatible(source_track, track)]
+        if not compatible:
+            failures.append(
+                f"{source_track.display_id} type={source_track.type} pid={source_track.source_pid_hex or source_track.source_pid or '-'} "
+                f"codec={source_track.codec or '-'} lang={source_track.language}"
+            )
+            continue
+
+        selected_temp = max(compatible, key=lambda item: _score_temp_track_candidate(source_track, item))
+        used_temp_ids.add(selected_temp["id"])
+        track_sources[source_track.id] = {
+            "path": str(temp_mkv_path),
+            "track_id": selected_temp["id"],
+            "cleanup_paths": [str(temp_mkv_path)],
+            "source_id": selected_temp.get("source_id"),
+            "type": source_track.type,
+        }
+        debug_print(f"[green][debug] MakeMKV 回绑: {_format_track_debug(source_track)} <= {_format_temp_track_debug(selected_temp)}[/green]")
+
+    if failures or len(track_sources) != len(selected_tracks):
+        mapped_ids = set(track_sources)
+        missing_tracks = [track for track in selected_tracks if track.id not in mapped_ids]
+        for track in missing_tracks:
+            failures.append(f"{track.display_id} type={track.type} pid={track.source_pid_hex or track.source_pid or '-'} codec={track.codec or '-'}")
+
+        available = ", ".join(_format_temp_track_debug(track) for track in temp_tracks) or "none"
+        failure_text = "; ".join(dict.fromkeys(failures))
+        raise RuntimeError(f"MakeMKV 轨道回绑失败：{failure_text}. 可用临时轨道：{available}")
+
+    return track_sources
+
+
+def extract_tracks_with_makemkv(
+    mpls_path: Path,
+    title: str,
+    source_tracks: List[Track],
+    selected_tracks: Optional[List[Track]],
+    output_dir: Path,
+    reuse_existing: bool = False,
+    console: Optional[Console] = None,
+) -> Tuple[Dict[int, Dict[str, Any]], Path, List[Track], List[Track]]:
+    """问题盘路径：使用 MakeMKV 导出临时 MKV，并回绑最终保留轨道。"""
+    console = console or Console()
+    selected_tracks = selected_tracks or source_tracks
+    require_tools(["MakeMKV", "mkvmerge"])
+
+    # MakeMKV 输出不包含隐藏轨；问题盘 fallback 统一忽略用户误加回的隐藏轨，避免回绑失败。
+    ignored_hidden_tracks = [track for track in selected_tracks if _is_effectively_hidden_track(track)]
+    effective_selected_tracks = [track for track in selected_tracks if track not in ignored_hidden_tracks]
+    if ignored_hidden_tracks:
+        ignored_ids = ", ".join(track.display_id for track in ignored_hidden_tracks)
+        console.print(f"[yellow]提示：问题盘 MakeMKV 路径将忽略隐藏轨道：{ignored_ids}[/yellow]")
+    if not effective_selected_tracks:
+        raise RuntimeError("MakeMKV 回绑目标为空：当前仅选择了隐藏轨道，无法继续")
+
+    profile_path = get_makemkv_profile_path()
+    if profile_path is None:
+        raise RuntimeError("MakeMKV profile 配置文件不可用：请检查 CUSTOM_PATHS['MakeMKVProfile']")
+
+    disc_root = _resolve_disc_root_from_mpls(mpls_path)
+    info_output = run_makemkv_info_with_robot(disc_root, console=console)
+    tinfo = parse_makemkv_tinfo(info_output)
+    title_id = select_makemkv_title_by_playlist(tinfo, mpls_path)
+
+    temp_output_dir = output_dir / f"{title}.__makemkv_fallback"
+    temp_output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not reuse_existing:
+        stale_files = {path for path in temp_output_dir.glob("*.mkv") if path.is_file()}
+        cleanup_generated_paths(stale_files)
+
+    temp_mkv_path: Optional[Path] = None
+    if reuse_existing:
+        try:
+            temp_mkv_path = _resolve_makemkv_title_output(temp_output_dir, title_id)
+            debug_print(f"[dim][debug] 复用已存在的 MakeMKV 临时文件: {temp_mkv_path}[/dim]")
+        except RuntimeError:
+            temp_mkv_path = None
+
+    if temp_mkv_path is None:
+        temp_mkv_path = run_makemkv_title_extract(
+            disc_root=disc_root,
+            title_id=title_id,
+            output_dir=temp_output_dir,
+            console=console,
+            profile_path=profile_path,
+        )
+
+    temp_tracks = scan_temp_mkv_tracks(temp_mkv_path)
+    track_sources = map_tracks_to_temp_mkv(source_tracks, effective_selected_tracks, temp_tracks, temp_mkv_path)
+    return track_sources, temp_mkv_path, effective_selected_tracks, ignored_hidden_tracks
+
+
+def build_mkvmerge_command_for_temp_mkv(
+    output_path: str,
+    temp_mkv_path: Path,
+    tracks: List[Track],
+    title: str,
+    track_sources: Dict[int, Dict[str, Any]],
+    cover_path: Optional[Path] = None,
+    chapters_file: Optional[str] = None,
+) -> List[str]:
+    """构建基于单个临时 MKV 输入的 mkvmerge 命令。"""
+    cmd = [find_executable("mkvmerge") or "mkvmerge", "-o", output_path]
+    _append_mkvmerge_title_and_chapters(cmd, title, chapters_file)
+
+    _append_mkvmerge_track_selection_with_resolver(cmd, tracks, lambda track: int(track_sources[track.id]["track_id"]))
+
+    track_order_parts = []
+    for track in tracks:
+        source_info = track_sources.get(track.id)
+        if not source_info:
+            raise RuntimeError(f"轨道 {track.display_id} 缺少临时 MKV 回绑信息")
+        local_track_id = int(source_info["track_id"])
+        _append_mkvmerge_track_args(cmd, track, local_track_id, source_info.get("sync_ms", track.mkvmerge_sync_ms))
+        track_order_parts.append(f"0:{local_track_id}")
+
+    cmd.extend(["--track-order", ",".join(track_order_parts)])
+    _append_mkvmerge_cover_attachment(cmd, cover_path)
+    cmd.append(str(temp_mkv_path))
     return cmd
 
 
-def run_mkvmerge_with_progress(cmd: List[str]) -> bool:
-    """执行 mkvmerge 并显示进度，兼容警告状态码，使用 tmp 缓存写入并清理空文件夹"""
+def collect_generated_paths(track_sources: Optional[Dict[int, Dict[str, Any]]] = None, chapters_file: Optional[str] = None) -> Set[Path]:
+    """收集外部处理过程中生成的中间文件。"""
+    generated_paths: Set[Path] = set()
+
+    for source_info in (track_sources or {}).values():
+        cleanup_paths = source_info.get("cleanup_paths") or [source_info.get("path")]
+        for path_str in cleanup_paths:
+            if path_str:
+                generated_paths.add(Path(path_str))
+
+    if chapters_file:
+        generated_paths.add(Path(chapters_file))
+
+    return generated_paths
+
+
+def cleanup_generated_paths(paths: Set[Path], console: Optional[Console] = None) -> None:
+    """清理外部处理过程中产生的中间文件。"""
+    cleaned_count = 0
+    for path in sorted(paths, key=lambda item: len(str(item)), reverse=True):
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+                cleaned_count += 1
+            elif path.exists() and path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+                cleaned_count += 1
+        except OSError:
+            continue
+
+    if cleaned_count and console:
+        console.print(f"[dim]已清理 {cleaned_count} 个中间文件[/dim]")
+
+
+def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
+    """执行外部命令并同步转发输出，同时收集完整文本。"""
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=NO_WINDOW_CREATION_FLAGS,
+    )
+
+    output_chunks = []
+    progress_patterns = [
+        re.compile(r"^(analyze|process):\s+\d+%$", re.IGNORECASE),
+        re.compile(r"^进度:\s*\d+%$"),
+        re.compile(r"^\d+\s*%\s*$"),
+    ]
+    last_line_was_progress = False
+
+    def _is_progress_line(text: str) -> bool:
+        stripped = text.strip()
+        return any(pattern.match(stripped) for pattern in progress_patterns)
+
+    if process.stdout:
+        for line in process.stdout:
+            if _is_progress_line(line):
+                sys.stdout.write("\r" + line.strip())
+                sys.stdout.flush()
+                last_line_was_progress = True
+            else:
+                if last_line_was_progress:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    last_line_was_progress = False
+                print(line, end="")
+            output_chunks.append(line)
+
+    if last_line_was_progress:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    return process.wait(), "".join(output_chunks)
+
+
+def _run_command_with_status(
+    cmd: List[str],
+    console: Console,
+    start_message: str,
+    success_message: Optional[str] = None,
+) -> Tuple[int, str]:
+    """带简要状态提示地执行长耗时外部命令，并实时输出其日志。"""
+    console.print(f"[cyan]{start_message}[/cyan]")
+    returncode, output_text = _run_subprocess_with_live_output(cmd)
+    if returncode == 0 and success_message:
+        console.print(f"[green]{success_message}[/green]")
+    return returncode, output_text
+
+
+def run_mkvmerge_with_progress(cmd: List[str], max_retries: int = 2, stop_on_problem_disc: bool = False) -> Dict[str, Any]:
+    """执行 mkvmerge 并显示进度，返回成功状态与诊断输出。"""
     console = Console()
 
     # 动态拦截并修改输出路径为 .tmp
@@ -3534,21 +4231,25 @@ def run_mkvmerge_with_progress(cmd: List[str]) -> bool:
             except Exception:
                 pass
 
-    max_retries = 2
     for attempt in range(max_retries):
         try:
-            result = subprocess.run(cmd, check=False)  ## 直接运行 mkvmerge，不捕获输出（让它直接输出到终端）
+            returncode, output_text = _run_subprocess_with_live_output(cmd)
+            problem_reason = classify_problem_disc_error(output_text) if stop_on_problem_disc else None
 
             # mkvmerge 状态码: 0=完美, 1=有警告但成功, 2=严重错误
-            if result.returncode in (0, 1):
-                if result.returncode == 1:
+            if returncode in (0, 1):
+                if returncode == 1:
                     console.print("  [yellow]提示：mkvmerge 报告了非致命警告，但文件已成功生成。[/yellow]")
 
                 # 执行成功，重命名回原格式
                 if tmp_output and tmp_output.exists():
                     tmp_output.replace(final_output)
-                return True
+                return {"success": True, "output": output_text, "returncode": returncode, "problem_reason": None}
             else:
+                if problem_reason:
+                    _cleanup_tmp()
+                    return {"success": False, "output": output_text, "returncode": returncode, "problem_reason": problem_reason}
+
                 # 返回码 >= 2 才是真正的失败
                 if attempt < max_retries - 1:
                     console.print("[yellow]⚠ 遇到错误或文件被占用，等待 2 秒后重试...[/yellow]")
@@ -3556,7 +4257,7 @@ def run_mkvmerge_with_progress(cmd: List[str]) -> bool:
                     continue
 
                 _cleanup_tmp()
-                return False
+                return {"success": False, "output": output_text, "returncode": returncode, "problem_reason": None}
 
         except KeyboardInterrupt:
             console.print(f"\n[yellow]检测到手动中断，正在清理...[/yellow]")
@@ -3566,9 +4267,9 @@ def run_mkvmerge_with_progress(cmd: List[str]) -> bool:
         except Exception as e:
             console.print(f"\n[red]✗ 执行 mkvmerge 时出错：{e}[/red]")
             _cleanup_tmp()
-            return False
+            return {"success": False, "output": str(e), "returncode": -1, "problem_reason": None}
 
-    return False
+    return {"success": False, "output": "", "returncode": -1, "problem_reason": None}
 
 
 # ==============================================================================
@@ -3819,9 +4520,17 @@ def scan_tracks_with_ffprobe(m2ts_path: Path, chapter: Chapter) -> List[Track]:
         track = Track(stream["index"], stream_type)
 
         # PID 映射到语言
-        pid = int(stream.get("id", "0x0"), 16) if "id" in stream else 0
+        raw_stream_id = stream.get("id", "0x0")
+        pid = int(raw_stream_id, 16) if "id" in stream else 0
+        track.source_pid = pid
+        track.source_pid_hex = raw_stream_id[2:].upper() if isinstance(raw_stream_id, str) and raw_stream_id.lower().startswith("0x") else ""
         if pid in chapter.pid_to_lang:
             track.language = chapter.pid_to_lang[pid]
+        elif stream_type in ("audio", "subtitle") and pid > 0:
+            # 在当前 MPLS 的主 PlayItem 语言映射中缺失该 PID。
+            # 这类轨道通常是隐藏/不可见流，先打上隐藏候选提示，
+            # 后续 BDInfo 匹配与问题盘回绑会据此做保守处理。
+            track.source_hidden_hint = True
 
         # 编码名称映射
         codec_name = stream.get("codec_name", "").lower()
@@ -4027,9 +4736,7 @@ class ISOmountManager:
         # 2. -NonInteractive 非交互模式，避免任何卡死的确认弹窗
         # 3. -Command "-" 通过标准输入读取脚本，完美避开路径里的引号转义 Bug
         cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", "-"]
-        result = subprocess.run(
-            cmd, input=ps_script, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-        )
+        result = subprocess.run(cmd, input=ps_script, capture_output=True, text=True, creationflags=NO_WINDOW_CREATION_FLAGS)
 
         if result.returncode != 0:
             stderr = result.stderr.lower()
@@ -4124,7 +4831,7 @@ class ISOmountManager:
         unmount_cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", f"Dismount-DiskImage -ImagePath '{iso_path.absolute()}' | Out-Null"]
 
         try:
-            subprocess.run(unmount_cmd, capture_output=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+            subprocess.run(unmount_cmd, capture_output=True, check=True, creationflags=NO_WINDOW_CREATION_FLAGS)
         except subprocess.CalledProcessError:
             # 不抛出异常 - 允许优雅降级
             pass
@@ -4172,7 +4879,12 @@ def _process_iso_source(source: Dict, mount_manager: ISOmountManager, console: C
 
 
 def select_main_playlist(
-    bdmv_path: Path, console: Console, context_name: Optional[str] = None, auto_skip: bool = True
+    bdmv_path: Path,
+    console: Console,
+    context_name: Optional[str] = None,
+    auto_skip: bool = True,
+    preferred_playlist: Optional[str] = None,
+    force_first_candidate: bool = False,
 ) -> Tuple[Optional[Chapter], Optional[Path]]:
     """
     扫描 MPLS 文件并选择正片
@@ -4200,9 +4912,17 @@ def select_main_playlist(
     if context_name:
         prompt += f" - {context_name}"
 
-    # 用户选择
-    cli = InteractiveCLI()
-    selected_idx = cli.select_from_candidates(candidates, prompt, auto_skip=auto_skip)
+    preferred_idx = select_candidate_index_by_bdinfo_playlist(candidates, preferred_playlist)
+    if preferred_idx is not None and force_first_candidate:
+        selected_idx = preferred_idx
+        console.print(f"[green]✓ 已按 BDInfo PLAYLIST 自动匹配：{candidates[selected_idx]['mpls_name']}[/green]")
+    elif force_first_candidate and candidates:
+        selected_idx = 0
+        console.print(f"[yellow]提示：BDInfo 未命中，已自动回退到候选第一项：{candidates[selected_idx]['mpls_name']}[/yellow]")
+    else:
+        # 用户选择
+        cli = InteractiveCLI()
+        selected_idx = cli.select_from_candidates(candidates, prompt, auto_skip=auto_skip, bdinfo_playlist=preferred_playlist)
 
     if selected_idx == -2:
         return None, None
@@ -4306,7 +5026,13 @@ def parse_bdinfo_optional(bdinfo_path: Optional[Path], mpls_name: str, console: 
 # ==============================================================================
 
 
-def workflow_phase1_scan_mpls(bdmv_path: Path, console: Console, auto_skip: bool = True) -> Tuple[Optional[Chapter], Optional[Path]]:
+def workflow_phase1_scan_mpls(
+    bdmv_path: Path,
+    console: Console,
+    auto_skip: bool = True,
+    preferred_playlist: Optional[str] = None,
+    force_first_candidate: bool = False,
+) -> Tuple[Optional[Chapter], Optional[Path]]:
     """阶段1：扫描 MPLS 文件并选择正片
 
     Args:
@@ -4322,7 +5048,13 @@ def workflow_phase1_scan_mpls(bdmv_path: Path, console: Console, auto_skip: bool
     console.print("\n[bold cyan]阶段 1：扫描 MPLS 文件[/bold cyan]")
 
     # 调用公共函数
-    chapter, mpls_path = select_main_playlist(bdmv_path, console, auto_skip=auto_skip)
+    chapter, mpls_path = select_main_playlist(
+        bdmv_path,
+        console,
+        auto_skip=auto_skip,
+        preferred_playlist=preferred_playlist,
+        force_first_candidate=force_first_candidate,
+    )
     if chapter is None or mpls_path is None:
         return None, None
 
@@ -4825,7 +5557,10 @@ def integrate_and_prepare_tracks(
     sorted_all_subtitle = sorted(copy.deepcopy(subtitle_tracks), key=sorter._subtitle_sort_key)
     sorted_all = copy.deepcopy(video_tracks) + sorted_all_audio + sorted_all_subtitle
 
-    # 工作列表：过滤 + 排序
+    # 工作列表：先剔除隐藏轨，再过滤 + 排序（all 视图仍保留完整轨道）
+    video_tracks = [track for track in video_tracks if not _is_effectively_hidden_track(track)]
+    audio_tracks = [track for track in audio_tracks if not _is_effectively_hidden_track(track)]
+    subtitle_tracks = [track for track in subtitle_tracks if not _is_effectively_hidden_track(track)]
     audio_tracks = sorter.filter_and_sort_audio(audio_tracks)
 
     debug_print("\n[dim]调试信息：排序后的音频轨道[/dim]")
@@ -4941,68 +5676,111 @@ def workflow_phase6_extract_metadata(bdmv_path: Path, chapter: Chapter, output_d
     else:
         console.print("  封面：未找到")
 
-    console.print(f"  章节：{chapter.get_chapter_count()} 个")
+    chapter_count = chapter.get_chapter_count()
+    console.print(f"  章节：{chapter_count} 个")
 
-    # 如果MPLS没有章节，尝试生成OGM章节文件
+    # 如果 MPLS 没有章节标记，尝试按分段边界回退生成 OGM 章节文件
     chapters_file = None
-    if chapter.get_chapter_count() == 0:
-        console.print("  [yellow]警告：MPLS没有章节信息，尝试生成章节文件[/yellow]")
-        timestamps = chapter.get_chapter_timestamps()
-        if timestamps:
+    if chapter_count == 0:
+        console.print("  [yellow]警告：MPLS没有章节标记，尝试按分段边界生成章节文件[/yellow]")
+        timestamps = get_segment_boundary_timestamps(chapter)
+        if len(timestamps) >= 2:
             output_dir.mkdir(parents=True, exist_ok=True)
             chapters_file = str(output_dir / f"{title}_chapters.txt")
-            generate_ogm_chapters(chapter, chapters_file)
-            console.print(f"  章节文件：{Path(chapters_file).name}")
+            generate_ogm_chapters_from_timestamps(timestamps, chapters_file)
+            console.print(f"  章节文件：{Path(chapters_file).name}（基于分段边界）")
+        else:
+            console.print("  [yellow]提示：分段不足以构造章节，将继续使用输入源默认章节行为[/yellow]")
 
     return title, metadata, chapters_file
 
 
+# ==============================================================================
+# 主流程控制
+# ==============================================================================
+
+
 def workflow_phase7_remux(
-    output_dir: Path, mpls_path: Path, tracks: List[Track], title: str, metadata: Dict, chapters_file: Optional[str], console: Console
-) -> bool:
-    """
-    阶段7：执行 Remux
-
-    Args:
-        output_dir: 输出目录
-        mpls_path: MPLS 文件路径
-        tracks: 轨道列表
-        title: 标题
-        metadata: 元数据字典
-        chapters_file: 章节文件路径
-        console: Rich Console 对象
-
-    Returns:
-        是否成功
-    """
+    output_dir: Path,
+    mpls_path: Path,
+    tracks: List[Track],
+    title: str,
+    metadata: Dict,
+    chapters_file: Optional[str],
+    source_tracks: List[Track],
+    processing_decision: Dict[str, Any],
+    keep_temp: bool,
+    console: Console,
+) -> Tuple[bool, Dict[str, Any]]:
+    """阶段 7：执行 Remux，并在结束后统一清理 fallback 产物。"""
     console.print("\n[bold cyan]阶段 7：执行 Remux[/bold cyan]")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{title}.mkv"
 
     console.print(f"输出文件：{output_file}")
+    track_sources: Dict[int, Dict[str, Any]] = {}
+    effective_chapters_file = chapters_file
+    generated_paths: Set[Path] = collect_generated_paths(chapters_file=effective_chapters_file)
 
-    # 构建命令
-    cmd = build_mkvmerge_command(
-        output_path=str(output_file),
-        mpls_path=str(mpls_path),
-        tracks=tracks,
-        title=title,
-        cover_path=metadata["cover_path"],
-        chapters_file=chapters_file,
-    )
+    try:
+        if processing_decision.get("processing_mode") == "problem_fallback":
+            console.print("[cyan]当前处理路径：问题盘外部化兜底[/cyan]")
+            track_sources, temp_mkv_path, effective_tracks, ignored_hidden_tracks = extract_tracks_with_makemkv(
+                mpls_path,
+                title,
+                source_tracks,
+                tracks,
+                output_dir,
+                reuse_existing=keep_temp,
+                console=console,
+            )
+            if ignored_hidden_tracks:
+                # 保持后续摘要与实际封装一致
+                tracks[:] = effective_tracks
+            generated_paths = collect_generated_paths(track_sources, effective_chapters_file)
+            generated_paths.add(temp_mkv_path.parent)
+            cmd = build_mkvmerge_command_for_temp_mkv(
+                output_path=str(output_file),
+                temp_mkv_path=temp_mkv_path,
+                tracks=effective_tracks,
+                title=title,
+                track_sources=track_sources,
+                cover_path=metadata["cover_path"],
+                chapters_file=effective_chapters_file,
+            )
+        else:
+            cmd = build_mkvmerge_command(
+                output_path=str(output_file),
+                mpls_path=str(mpls_path),
+                tracks=tracks,
+                title=title,
+                cover_path=metadata["cover_path"],
+                chapters_file=effective_chapters_file,
+            )
 
-    console.print("\nmkvmerge 命令：")
-    console.print(" ".join(f'"{c}"' if " " in c else c for c in cmd))
-    console.print()
+        console.print("\nmkvmerge 命令：")
+        console.print(" ".join(f'"{c}"' if " " in c else c for c in cmd))
+        console.print()
 
-    # 执行
-    return run_mkvmerge_with_progress(cmd)
+        result = run_mkvmerge_with_progress(cmd, stop_on_problem_disc=processing_decision.get("is_multi_segment", False))
+        if not result["success"] and result.get("problem_reason"):
+            processing_decision["is_problem_disc"] = True
+            processing_decision["problem_reason"] = result["problem_reason"]
+            processing_decision["processing_mode"] = "problem_fallback"
+            console.print(f"[yellow]检测到问题盘特征：{result['problem_reason']}[/yellow]")
+        elif (
+            not result["success"] and processing_decision.get("is_multi_segment") and processing_decision.get("processing_mode") != "problem_fallback"
+        ):
+            processing_decision["is_problem_disc"] = True
+            processing_decision["problem_reason"] = "multi_segment_retry_failed"
+            processing_decision["processing_mode"] = "problem_fallback"
+            console.print("[yellow]多段盘原始直封重试后仍失败，已升级为问题盘并切换兜底。[/yellow]")
 
-
-# ==============================================================================
-# 主流程控制
-# ==============================================================================
+        return result["success"], processing_decision
+    finally:
+        if not keep_temp:
+            cleanup_generated_paths(generated_paths, console if generated_paths else None)
 
 
 def main_workflow(
@@ -5014,7 +5792,8 @@ def main_workflow(
     preconfirmed_config: Optional[Dict] = None,
     drop_commentary: bool = False,
     keep_best_audio: bool = False,
-    simplify_subs: bool = True,  # 新增
+    simplify_subs: bool = True,
+    keep_temp: bool = False,
     source_name: Optional[str] = None,
 ):
     """主流程封装
@@ -5029,9 +5808,18 @@ def main_workflow(
         drop_commentary: 是否全局剔除导评轨
         keep_best_audio: 是否每种语言仅保留最优音轨
         simplify_subs: 是否精简外语字幕（英语/原语言仅保留排序最优的一条）
+        keep_temp: 是否保留并复用问题盘外部化路径的中间文件
         source_name: 原盘名称（可选，传入以便在交互界面的表格中提示用户）
     """
     console = Console()
+    processing_decision = {
+        "segment_count": 1,
+        "is_multi_segment": False,
+        "is_problem_disc": False,
+        "problem_reason": None,
+        "processing_mode": "direct",
+    }
+    source_tracks: List[Track] = []
 
     # 如果提供了预确认配置，直接跳到 Remux 阶段
     if preconfirmed_config:
@@ -5042,13 +5830,22 @@ def main_workflow(
         mpls_path = bdmv_path / "PLAYLIST" / old_mpls_path.name
         chapter = preconfirmed_config["chapter"]
         final_tracks = preconfirmed_config["final_tracks"]
+        processing_decision = preconfirmed_config.get("processing_decision", processing_decision)
+        source_tracks = preconfirmed_config.get("source_tracks", copy.deepcopy(final_tracks))
     else:
         # 正常流程：阶段 1-5（可重试循环）
         auto_skip_phase1 = True
+        preferred_playlist = _extract_bdinfo_playlist_name(bdinfo_path)
 
         while True:
             # 阶段 1：扫描 MPLS 并选择正片
-            result = workflow_phase1_scan_mpls(bdmv_path, console, auto_skip=auto_skip_phase1)
+            result = workflow_phase1_scan_mpls(
+                bdmv_path,
+                console,
+                auto_skip=auto_skip_phase1,
+                preferred_playlist=preferred_playlist,
+                force_first_candidate=skip_interactive,
+            )
             if result == (None, None):  # back
                 console.print("[yellow]已经是第一步，无法返回[/yellow]")
                 auto_skip_phase1 = False
@@ -5069,8 +5866,12 @@ def main_workflow(
                 else:
                     raise
 
+            # 阶段 2.5：问题盘预检查（放在 BDInfo PLAYLIST 校验之后，避免无效预检查）
+            processing_decision = resolve_processing_mode(chapter, console)
+
             # 阶段 3：扫描轨道
             tracks = workflow_phase3_scan_tracks(bdmv_path, chapter, console)
+            source_tracks = copy.deepcopy(tracks)
 
             # 阶段 4：轨道排序
             video_tracks, audio_tracks, subtitle_tracks, view_data = workflow_phase4_integrate_bdinfo(
@@ -5099,7 +5900,34 @@ def main_workflow(
     title, metadata, chapters_file = workflow_phase6_extract_metadata(bdmv_path, chapter, output_dir, console)
 
     # 阶段 7：Remux 执行
-    success = workflow_phase7_remux(output_dir, mpls_path, final_tracks, title, metadata, chapters_file, console)
+    initial_processing_mode = processing_decision.get("processing_mode")
+    success, processing_decision = workflow_phase7_remux(
+        output_dir,
+        mpls_path,
+        final_tracks,
+        title,
+        metadata,
+        chapters_file,
+        source_tracks,
+        processing_decision,
+        keep_temp,
+        console,
+    )
+
+    if not success and initial_processing_mode != "problem_fallback" and processing_decision.get("processing_mode") == "problem_fallback":
+        console.print("[yellow]切换到问题盘兜底路径后重试 Remux...[/yellow]")
+        success, processing_decision = workflow_phase7_remux(
+            output_dir,
+            mpls_path,
+            final_tracks,
+            title,
+            metadata,
+            chapters_file,
+            source_tracks,
+            processing_decision,
+            keep_temp,
+            console,
+        )
 
     # 阶段 8：输出摘要
     if success:
@@ -5137,6 +5965,7 @@ def parse_arguments():
 
   # 自动丢弃导评，并且每种语言只保留最高规格音轨
   python bluray_remux.py -i /path/to/BluRays -o /output --commentary drop --best-audio yes
+
         """,
     )
 
@@ -5154,6 +5983,8 @@ def parse_arguments():
     parser.add_argument(
         "--simplify-subs", type=str, choices=["no", "yes", "ask"], default=None, help="精简外语字幕 (yes仅留最优/no保留所有/ask单盘询问)"
     )
+    parser.add_argument("--keep-temp", action="store_true", help="保留并复用问题盘 MakeMKV 临时 MKV（测试用，请勿开启）")
+    parser.add_argument("--debug", action="store_true", help="输出轨道补全、MakeMKV 回绑与封装调试信息（测试用，请勿开启）")
     return parser.parse_args()
 
 
@@ -5395,7 +6226,7 @@ def _preconfirm_single_disc(
 
     disc_keep_best_audio = global_keep_best_audio
     if disc_keep_best_audio is None:
-        disc_keep_best_audio = Confirm.ask(f"[yellow]是否为每种语言仅保留一条最高规格音轨？[/yellow]", default=False)
+        disc_keep_best_audio = Confirm.ask(f"[yellow]是否为每种语言仅保留一条最高规格音轨？[/yellow]", default=True)
 
     disc_simplify_subs = global_simplify_subs
     if disc_simplify_subs is None:
@@ -5442,6 +6273,8 @@ def _preconfirm_single_disc(
                 return "next"
             else:
                 raise
+
+        processing_decision = resolve_processing_mode(chapter, console)
 
         if bdinfo_data:
             console.print(f"[green]✓ 已解析 BDInfo[/green]")
@@ -5494,8 +6327,10 @@ def _preconfirm_single_disc(
         task["preconfirm_config"] = {
             "mpls_path": mpls_path,
             "chapter": chapter,
+            "source_tracks": copy.deepcopy(tracks),
             "final_tracks": final_tracks,
             "bdinfo_data": bdinfo_data,
+            "processing_decision": processing_decision,
         }
 
         console.print(f"[green]✓ {source['name']} - 配置确认完成[/green]")
@@ -5589,6 +6424,7 @@ def _run_single_remux_task(
     global_drop_commentary: Optional[bool],
     global_keep_best_audio: Optional[bool],
     global_simplify_subs: Optional[bool],
+    keep_temp: bool,
     mount_manager: Optional[ISOmountManager],
     console: Console,
 ) -> Literal["success", "failed", "skipped"]:
@@ -5644,6 +6480,7 @@ def _run_single_remux_task(
             drop_commentary=False,
             keep_best_audio=False,
             simplify_subs=False,
+            keep_temp=keep_temp,
             source_name=source["name"],
         )
     else:
@@ -5658,7 +6495,7 @@ def _run_single_remux_task(
 
         disc_keep_best_audio = global_keep_best_audio
         if disc_keep_best_audio is None and not skip_interactive:
-            disc_keep_best_audio = Confirm.ask("[yellow]是否为该原盘每种语言仅保留一条最高规格音轨？[/yellow]", default=False)
+            disc_keep_best_audio = Confirm.ask("[yellow]是否为该原盘每种语言仅保留一条最高规格音轨？[/yellow]", default=True)
         elif disc_keep_best_audio is None:
             disc_keep_best_audio = False
 
@@ -5678,6 +6515,7 @@ def _run_single_remux_task(
             drop_commentary=disc_drop_commentary,
             keep_best_audio=disc_keep_best_audio,
             simplify_subs=disc_simplify_subs,
+            keep_temp=keep_temp,
             source_name=source["name"],
         )
 
@@ -5702,7 +6540,8 @@ def batch_phase4_remux(
     continue_on_error: bool,
     global_drop_commentary: Optional[bool],
     global_keep_best_audio: Optional[bool],
-    global_simplify_subs: Optional[bool],  # 【新增参数】
+    global_simplify_subs: Optional[bool],
+    keep_temp: bool,
     console: Console,
 ) -> Tuple[int, int, int]:
     """
@@ -5744,7 +6583,15 @@ def batch_phase4_remux(
 
             try:
                 status = _run_single_remux_task(
-                    task, output_dir, skip_interactive, global_drop_commentary, global_keep_best_audio, global_simplify_subs, mount_manager, console
+                    task,
+                    output_dir,
+                    skip_interactive,
+                    global_drop_commentary,
+                    global_keep_best_audio,
+                    global_simplify_subs,
+                    keep_temp,
+                    mount_manager,
+                    console,
                 )
 
                 if status == "success":
@@ -5820,19 +6667,23 @@ def batch_phase5_report(tasks: List[Dict], success_count: int, failed_count: int
 
 def main():
     """主函数 - 批量处理模式"""
+    global DEBUG
     console = Console()
+
+    # 解析参数
+    args = parse_arguments()
+    DEBUG = args.debug
+    if DEBUG:
+        console.print("[yellow][debug] 调试输出已开启[/yellow]")
 
     # 检查工具链
     check_tools()
     print()
 
-    # 解析参数
-    args = parse_arguments()
-
     # 清理路径参数
-    root_dir = Path(clean_path(args.input))
-    output_dir = Path(clean_path(args.output))
-    bdinfo_dir = Path(clean_path(args.bdinfo_dir)) if args.bdinfo_dir else None
+    root_dir = clean_path(args.input)
+    output_dir = clean_path(args.output)
+    bdinfo_dir = clean_path(args.bdinfo_dir) if args.bdinfo_dir else None
 
     # 验证路径
     if not root_dir.exists():
@@ -5851,7 +6702,7 @@ def main():
         # 阶段 2：匹配 BDInfo 和推断原语言
         tasks = batch_phase2_match_bdinfo(sources, bdinfo_dir, args.continue_on_error, console)
 
-        # 优先使用命令行参数，如果未指定则设为安全默认值 (保留导评，不精简音轨，只使用脚本默认过滤规则)
+        # 优先使用命令行参数；未指定时按交互流程询问（静默模式下仍使用安全默认值）
         # 解析全局过滤策略 (True=处理, False=不处理, None=单盘询问)
         global_drop_commentary = False
         global_keep_best_audio = False
@@ -5878,9 +6729,9 @@ def main():
 
                 if args.best_audio is None:
                     choice = Prompt.ask(
-                        "[yellow]最高规格音轨精简策略[/yellow]\n  [cyan]no[/cyan]  : 按脚本默认规则保留音轨 (默认)\n  [cyan]yes[/cyan] : 全局每种语言仅留一条最高规格\n  [cyan]ask[/cyan] : 每个原盘单独询问\n请选择",
+                        "[yellow]最高规格音轨精简策略[/yellow]\n  [cyan]yes[/cyan] : 全局每种语言仅留一条最高规格 (默认)\n  [cyan]no[/cyan]  : 按脚本默认规则保留音轨\n  [cyan]ask[/cyan] : 每个原盘单独询问\n请选择",
                         choices=["no", "yes", "ask"],
-                        default="no",
+                        default="yes",
                     )
                     global_keep_best_audio = _parse_tri_state(choice, true_val="yes")
                 else:
@@ -5907,7 +6758,14 @@ def main():
 
         # 阶段 3.5：统一预确认
         if not args.skip_interactive and batch_mode == "preconfirm":
-            batch_phase3_5_preconfirm(tasks, args.continue_on_error, global_drop_commentary, global_keep_best_audio, global_simplify_subs, console)
+            batch_phase3_5_preconfirm(
+                tasks,
+                args.continue_on_error,
+                global_drop_commentary,
+                global_keep_best_audio,
+                global_simplify_subs,
+                console,
+            )
 
         # 阶段 4：批量 Remux
         success_count, failed_count, skipped_count = batch_phase4_remux(
@@ -5918,6 +6776,7 @@ def main():
             global_drop_commentary,
             global_keep_best_audio,
             global_simplify_subs,
+            args.keep_temp,
             console,
         )
 
