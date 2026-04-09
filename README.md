@@ -12,17 +12,18 @@
 |---|---|---|---|
 | `-i`, `--input` | **是** | — | 包含蓝光原盘（文件夹）或 ISO 文件的根目录，支持递归扫描多层子目录 |
 | `-o`, `--output` | 否 | `./output` | 输出 MKV 文件的保存目录 |
+| `-t`, `--temp` | 否 | — | `MakeMKV` 临时目录；未指定时默认使用 `<输出目录>/<原盘目录>/temp/<标题>/` |
 | `--bdinfo-dir` | 否 | — | 外部 BDInfo 文本的统一存放目录 |
 | `--commentary` | 否 | `ask` | 导评轨道处理策略（`keep` 保留 / `drop` 剔除 / `ask` 询问） |
 | `--best-audio` | 否 | `ask` | 最高规格音轨精简策略（交互询问时默认 `yes`；`no` 保留全部 / `yes` 仅保留最高规格 / `ask` 询问） |
 | `--simplify-subs` | 否 | `ask` | 外语字幕精简策略（`yes` 默认精简外语 / `no` 全部保留 / `ask` 询问） |
 | `--skip-interactive` | 否 | — | 开启全自动静默模式，跳过所有手动确认和轨道编辑环节 |
 | `--continue-on-error`| 否 | — | 容错模式，某个原盘处理报错时自动跳过并继续处理下一个 |
-| `--keep-temp` | 否 | — | 保留并复用问题盘 `MakeMKV` 临时 MKV（测试使用，请勿开启） |
+| `--keep-temp` | 否 | — | 保留并复用 `MakeMKV` 产出的临时 MKV（测试使用，请勿开启） |
 | `--debug` | 否 | — | 输出轨道补全、MakeMKV 回绑匹配、mkvmerge 命令与处理路径等调试信息（测试使用，请勿开启） |
 
 > **💡 路径参数提示：**
-> 在使用 Docker 容器时，参数中的 `-i /input` 和 `-o /output` **通常不需要修改**，因为它们指向的是容器内部的固定绝对路径。只需要在挂载配置（`volumes`）中修改对应的宿主机（本地）路径即可。
+> 在使用 Docker 容器时，参数中的 `-i /input`、`-o /output`、`-t /temp` **通常不需要修改**，因为它们指向的是容器内部的固定绝对路径。只需要在挂载配置（`volumes`）中修改对应的宿主机（本地）路径即可。临时目录不建议使用 `/tmp`，因为当前镜像已将 `/tmp` 用作 `tmpfs` 系统临时目录。
 
 ---
 
@@ -51,7 +52,7 @@
   - 初始工作集合会自动剔除隐藏轨（BDInfo `*` 或 hidden hint）。
   - 可在交互 `all` 视图中通过 `add` 手动加回。
   - 但问题盘 MakeMKV 路径会在最终回绑阶段再次忽略隐藏轨，避免匹配失败。
-- `--keep-temp` 未开启时，问题盘流程结束后会自动清理临时 MKV 以及空的 `.__makemkv_fallback` 目录。
+- `--keep-temp` 未开启时，问题盘流程结束后会自动清理临时 MKV，以及空的标题临时目录和 `temp/` 目录。
 
 ### `--skip-interactive` 选片规则
 - 静默模式下，会优先使用 BDInfo 中的 `PLAYLIST` 命中目标 `mpls`。
@@ -107,6 +108,10 @@ EOF
 docker pull ghcr.io/chen8945/bluray-remuxkit:latest
 ```
 
+- 镜像内已内置 `makemkvcon`、`default.mmcp.xml` 和 `settings.conf`。
+- 构建时会自动抓取官方论坛最新 `MakeMKV` beta key，容器启动时会再次校验；若 key 失效，会联网刷新。
+- 因此 Docker 运行阶段不能再使用 `--network none`，否则 key 自动刷新会失败。
+
 ### 前提条件
 - 宿主机必须是 **Linux**。
 - 已安装 Docker。
@@ -125,7 +130,6 @@ docker pull ghcr.io/chen8945/bluray-remuxkit:latest
 
 ```bash
 docker run --rm -it \
-  --network none \
   --init \
   --security-opt apparmor:unconfined \
   --security-opt seccomp:unconfined \
@@ -140,15 +144,17 @@ docker run --rm -it \
   --tmpfs /tmp:exec \
   -v "$PWD":/input:ro \
   -v "$PWD/../Remux_Output":/output \
+  -v "$PWD/../Remux_Temp":/temp \
   ghcr.io/chen8945/bluray-remuxkit:latest \
   -i /input \
   -o /output \
+  -t /temp \
   --continue-on-error \
   --commentary drop \
   --best-audio yes \
   --simplify-subs yes
 ```
-> **巧妙的路径隔离**：通过 `-v "$PWD/../Remux_Output":/output`，输出文件会被自动生成在当前目录的**上一级目录**中。
+> **巧妙的路径隔离**：通过 `-v "$PWD/../Remux_Output":/output` 与 `-v "$PWD/../Remux_Temp":/temp`，可以把最终输出与问题盘临时文件分开存放在当前目录的**上一级目录**中。
 
 ### 使用 Docker Compose
 
@@ -159,7 +165,8 @@ docker run --rm -it \
 BluRayRemuxKit/
 ├── docker-compose.yaml
 ├── input/          ← 放入蓝光原盘或 ISO
-└── output/         ← Remux 输出目录
+├── output/         ← Remux 输出目录
+└── temp/           ← 问题盘临时目录
 ```
 
 **2. 🌟 推荐运行参数：**
@@ -168,6 +175,7 @@ BluRayRemuxKit/
 docker compose run --rm remuxkit \
   -i /input \
   -o /output \
+  -t /temp \
   --continue-on-error \
   --commentary drop \
   --best-audio yes \
@@ -176,12 +184,12 @@ docker compose run --rm remuxkit \
 
 **3. 交互模式**（保留所有的手动确认和轨道编辑环节）：
 ```bash
-docker compose run --rm remuxkit -i /input -o /output
+docker compose run --rm remuxkit -i /input -o /output -t /temp
 ```
 
 **4. 全自动模式**：
 ```bash
-docker compose run --rm remuxkit -i /input -o /output --skip-interactive
+docker compose run --rm remuxkit -i /input -o /output -t /temp --skip-interactive
 ```
 
 **5. 极致精简模式**（全自动+最高规格+无报错中断）：
@@ -189,6 +197,7 @@ docker compose run --rm remuxkit -i /input -o /output --skip-interactive
 docker compose run --rm remuxkit \
   -i /input \
   -o /output \
+  -t /temp \
   --skip-interactive \
   --commentary drop \
   --best-audio yes \
@@ -225,7 +234,7 @@ docker compose run --rm remuxkit \
   - [ffprobe](https://ffmpeg.org/)（FFprobe，可单独安装，不要求完整 FFmpeg）
 - **问题盘兜底工具**（仅问题盘路径需要）：
   - `MakeMKV`（`makemkvcon`）
-  - `MakeMKV` 配置文件（默认：`D:\MakeMKV\KeepAll.mmcp.xml`，可在脚本 `CUSTOM_PATHS` 中修改）
+  - `MakeMKV` 配置文件（未指定时使用脚本自带默认配置文件）
 - **Python 库**：`rich`、`pycountry`
 - **可选增强输入依赖**：`prompt_toolkit`
   - 用于改善 SSH / Linux / Windows 下的交互输入体验，支持上下键历史、左右移动与更自然的命令行编辑

@@ -26,6 +26,8 @@ import copy
 import shutil
 import tempfile
 import subprocess
+import threading
+import queue
 import argparse
 import shlex
 import mimetypes
@@ -64,7 +66,7 @@ NO_WINDOW_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32
 CUSTOM_PATHS = {
     "mkvmerge": "",
     "ffprobe": "",
-    "MakeMKV": "D:/MakeMKV/makemkvcon64.exe",
+    "makemkvcon": "D:/MakeMKV/makemkvcon64.exe",
     "MakeMKVProfile": "D:/MakeMKV/KeepAll.mmcp.xml",
 }
 
@@ -137,8 +139,6 @@ TRACK_KEYWORDS = {
     "commentary": ["导评", "评论", "commentary"]      # 导评标识
 }
 
-# fmt: on
-
 # 非法文件名字符替换（Windows 兼容）
 ILLEGAL_CHAR_MAP = {"?": "？", "*": "★", "<": "《", ">": "》", ":": "：", '"': "'", "/": "／", "\\": "／", "|": "￨"}
 
@@ -157,7 +157,7 @@ BDINFO_PASTE_SENTINEL = "EOF"
 MKVMERGE_VIDEO_TRACK_PATTERN = re.compile(r"\bID\s+\d+:\s+video\b", re.IGNORECASE)
 PROBLEM_DISC_ERROR_PATTERNS = [
     ("audio_channels_mismatch", [r"声道数不同|channels are different"]),
-    ("append_missing_track", [r"没有轨道可以追加到该轨道|there is no track to append", r"--append-to.+(?:无效|invalid)"]),
+    ("append_missing_track", [r"没有轨道可以追加到该轨道|there is no track to append|no track can be appended", r"不含 ID 为|does not contain a track with the ID", r"--append-to.+(?:无效|invalid)",],),
     ("append_track_mismatch", [r"无法追加到|cannot (?:append|be appended to)"]),
 ]
 MKVMERGE_BENIGN_WARNING_PATTERNS = [
@@ -165,7 +165,7 @@ MKVMERGE_BENIGN_WARNING_PATTERNS = [
     re.compile(r"invalid data.*skipping.*(?:out of sync|audio/video may be desynchronized)", re.IGNORECASE),
 ]
 MAKEMKV_TINFO_PATTERN = re.compile(r'^TINFO:(\d+),(\d+),\d+,"(.*)"$')
-
+# fmt: on
 
 # ==============================================================================
 # 语言代码转换函数（基于 pycountry）
@@ -480,8 +480,10 @@ def _parse_tri_state(value: str, true_val: str, ask_val: str = "ask") -> Optiona
 TOOL_PROBE_ARGS = {
     "mkvmerge": ["--version"],
     "ffprobe": ["-version"],
-    "MakeMKV": [],
+    "makemkvcon": [],
 }
+
+DEFAULT_MAKEMKV_PROFILE_NAME = "default.mmcp.xml"
 
 
 def clean_path(path_str: str) -> Path:
@@ -628,11 +630,19 @@ def find_executable(tool_name: str) -> Optional[str]:
 
 def get_makemkv_profile_path() -> Optional[Path]:
     """返回 MakeMKV profile 配置文件路径。"""
-    profile_path = CUSTOM_PATHS.get("MakeMKVProfile", "")
+    profile_path = os.environ.get("MAKEMKV_PROFILE", "").strip() or CUSTOM_PATHS.get("MakeMKVProfile", "").strip()
     if not profile_path:
         return None
     path = Path(profile_path)
     return path if path.is_file() else None
+
+
+def require_executable(tool_name: str) -> str:
+    """返回已解析的可执行文件路径；找不到时直接报错。"""
+    tool_path = find_executable(tool_name)
+    if tool_path is None:
+        raise RuntimeError(f"工具不可用：{tool_name}")
+    return tool_path
 
 
 def _probe_single_tool(tool_name: str) -> Tuple[str, Optional[str]]:
@@ -789,7 +799,7 @@ def probe_multi_segment_video_tracks(stream_dir: Path, segment_names: List[str],
     站在 mkvmerge 视角做多段盘准入检测：
     对每个分段执行 mkvmerge -i，只判断是否识别到视频轨。
     """
-    mkvmerge = find_executable("mkvmerge") or "mkvmerge"
+    mkvmerge = require_executable("mkvmerge")
     has_inline_progress = False
     console.print(f"[cyan]检测到多段播放列表，共 {len(segment_names)} 段；执行预检查...[/cyan]")
     console.print("[dim]预检查规则：仅检查 mkvmerge 是否能识别每段视频轨[/dim]")
@@ -3620,7 +3630,7 @@ def build_mkvmerge_command(
     output_path: str, mpls_path: str, tracks: List[Track], title: str, cover_path: Optional[Path] = None, chapters_file: Optional[str] = None
 ) -> List[str]:
     """构建基于播放列表输入的 mkvmerge 命令。"""
-    cmd = [find_executable("mkvmerge") or "mkvmerge", "-o", output_path]
+    cmd = [require_executable("mkvmerge"), "-o", output_path]
     _append_mkvmerge_title_and_chapters(cmd, title, chapters_file)
     _append_mkvmerge_track_selection(cmd, tracks)
 
@@ -3721,22 +3731,83 @@ def _resolve_disc_root_from_mpls(mpls_path: Path) -> Path:
 
 def run_makemkv_info_with_robot(disc_root: Path, console: Optional[Console] = None) -> str:
     """执行 `makemkvcon -r info` 并返回输出文本（静默模式，仅打印开始/完成）。"""
-    require_tools(["MakeMKV"])
+    require_tools(["makemkvcon"])
     console = console or Console()
-    makemkv = find_executable("MakeMKV") or "makemkvcon"
+    makemkv = require_executable("makemkvcon")
     cmd = [makemkv, "-r", "info", f"file:{disc_root}"]
     console.print("[cyan]MakeMKV 正在读取原盘信息（-r info）...[/cyan]")
-    result = subprocess.run(
+
+    process = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
         errors="replace",
-        check=False,
         creationflags=NO_WINDOW_CREATION_FLAGS,
     )
-    output_text = (result.stdout or "") + (result.stderr or "")
-    if result.returncode != 0:
+
+    output_chunks: List[str] = []
+    output_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+    read_started = False
+    timed_out = False
+    idle_timeout_seconds = 15
+    last_output_at = time.monotonic()
+    info_record_prefixes = ("DRV:", "MSG:", "CINFO:", "TINFO:", "SINFO:", "TCOUNT:")
+
+    def _reader() -> None:
+        try:
+            if process.stdout:
+                for line in process.stdout:
+                    output_queue.put(line)
+        finally:
+            output_queue.put(None)
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
+    try:
+        while True:
+            try:
+                item = output_queue.get(timeout=0.2)
+            except queue.Empty:
+                if read_started and process.poll() is None and (time.monotonic() - last_output_at) >= idle_timeout_seconds:
+                    timed_out = True
+                    console.print(f"[yellow]MakeMKV -r info 输出静默超过 {idle_timeout_seconds} 秒，终止该进程并使用已读取信息继续。[/yellow]")
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                continue
+
+            if item is None:
+                break
+
+            line = item
+            output_chunks.append(line)
+            last_output_at = time.monotonic()
+            if line.startswith(info_record_prefixes):
+                read_started = True
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        raise
+
+    returncode = process.wait()
+    output_text = "".join(output_chunks)
+
+    if timed_out:
+        if parse_makemkv_tinfo(output_text):
+            console.print("[yellow]MakeMKV 原盘信息读取因静默超时提前结束，已使用已采集信息继续。[/yellow]")
+            return output_text
+        raise RuntimeError("MakeMKV -r info 因静默超时被终止，且未采集到可用 TINFO 信息。")
+
+    if returncode != 0:
         raise RuntimeError(f"MakeMKV 读取原盘信息失败：{output_text}")
     console.print("[green]MakeMKV 原盘信息读取完成[/green]")
     return output_text
@@ -3768,8 +3839,8 @@ def run_makemkv_title_extract(
     profile_path: Optional[Path] = None,
 ) -> Path:
     """执行 MakeMKV 单标题导出并返回输出 MKV 路径。"""
-    require_tools(["MakeMKV"])
-    makemkv = find_executable("MakeMKV") or "makemkvcon"
+    require_tools(["makemkvcon"])
+    makemkv = require_executable("makemkvcon")
     cmd = [makemkv]
     if profile_path:
         cmd.append(f"--profile={profile_path}")
@@ -3896,7 +3967,7 @@ def _format_temp_track_debug(temp_track: Dict[str, Any]) -> str:
 def scan_temp_mkv_tracks(temp_mkv_path: Path) -> List[Dict[str, Any]]:
     """使用 mkvmerge -J 读取临时 MKV 轨道信息。"""
     require_tools(["mkvmerge"])
-    mkvmerge = find_executable("mkvmerge") or "mkvmerge"
+    mkvmerge = require_executable("mkvmerge")
     result = subprocess.run(
         [mkvmerge, "-J", str(temp_mkv_path)],
         capture_output=True,
@@ -4024,14 +4095,14 @@ def extract_tracks_with_makemkv(
     title: str,
     source_tracks: List[Track],
     selected_tracks: Optional[List[Track]],
-    output_dir: Path,
+    temp_dir: Path,
     reuse_existing: bool = False,
     console: Optional[Console] = None,
 ) -> Tuple[Dict[int, Dict[str, Any]], Path, List[Track], List[Track]]:
     """问题盘路径：使用 MakeMKV 导出临时 MKV，并回绑最终保留轨道。"""
     console = console or Console()
     selected_tracks = selected_tracks or source_tracks
-    require_tools(["MakeMKV", "mkvmerge"])
+    require_tools(["makemkvcon", "mkvmerge"])
 
     # MakeMKV 输出不包含隐藏轨；问题盘 fallback 统一忽略用户误加回的隐藏轨，避免回绑失败。
     ignored_hidden_tracks = [track for track in selected_tracks if _is_effectively_hidden_track(track)]
@@ -4044,40 +4115,47 @@ def extract_tracks_with_makemkv(
 
     profile_path = get_makemkv_profile_path()
     if profile_path is None:
-        raise RuntimeError("MakeMKV profile 配置文件不可用：请检查 CUSTOM_PATHS['MakeMKVProfile']")
+        raise RuntimeError("MakeMKV profile 配置文件不可用：请设置 MAKEMKV_PROFILE 并确保其指向存在的 default.mmcp.xml")
 
     disc_root = _resolve_disc_root_from_mpls(mpls_path)
     info_output = run_makemkv_info_with_robot(disc_root, console=console)
     tinfo = parse_makemkv_tinfo(info_output)
     title_id = select_makemkv_title_by_playlist(tinfo, mpls_path)
 
-    temp_output_dir = output_dir / f"{title}.__makemkv_fallback"
+    temp_output_dir = temp_dir / title
     temp_output_dir.mkdir(parents=True, exist_ok=True)
+    temp_cleanup_paths: Set[Path] = {temp_output_dir, temp_dir}
 
-    if not reuse_existing:
-        stale_files = {path for path in temp_output_dir.glob("*.mkv") if path.is_file()}
-        cleanup_generated_paths(stale_files)
+    try:
+        if not reuse_existing:
+            stale_files = {path for path in temp_output_dir.glob("*.mkv") if path.is_file()}
+            cleanup_generated_paths(stale_files)
 
-    temp_mkv_path: Optional[Path] = None
-    if reuse_existing:
-        try:
-            temp_mkv_path = _resolve_makemkv_title_output(temp_output_dir, title_id)
-            debug_print(f"[dim][debug] 复用已存在的 MakeMKV 临时文件: {temp_mkv_path}[/dim]")
-        except RuntimeError:
-            temp_mkv_path = None
+        temp_mkv_path: Optional[Path] = None
+        if reuse_existing:
+            try:
+                temp_mkv_path = _resolve_makemkv_title_output(temp_output_dir, title_id)
+                debug_print(f"[dim][debug] 复用已存在的 MakeMKV 临时文件: {temp_mkv_path}[/dim]")
+            except RuntimeError:
+                temp_mkv_path = None
 
-    if temp_mkv_path is None:
-        temp_mkv_path = run_makemkv_title_extract(
-            disc_root=disc_root,
-            title_id=title_id,
-            output_dir=temp_output_dir,
-            console=console,
-            profile_path=profile_path,
-        )
+        if temp_mkv_path is None:
+            temp_mkv_path = run_makemkv_title_extract(
+                disc_root=disc_root,
+                title_id=title_id,
+                output_dir=temp_output_dir,
+                console=console,
+                profile_path=profile_path,
+            )
 
-    temp_tracks = scan_temp_mkv_tracks(temp_mkv_path)
-    track_sources = map_tracks_to_temp_mkv(source_tracks, effective_selected_tracks, temp_tracks, temp_mkv_path)
-    return track_sources, temp_mkv_path, effective_selected_tracks, ignored_hidden_tracks
+        temp_tracks = scan_temp_mkv_tracks(temp_mkv_path)
+        track_sources = map_tracks_to_temp_mkv(source_tracks, effective_selected_tracks, temp_tracks, temp_mkv_path)
+        return track_sources, temp_mkv_path, effective_selected_tracks, ignored_hidden_tracks
+    except BaseException:
+        if not reuse_existing:
+            temp_cleanup_paths.update(path for path in temp_output_dir.rglob("*"))
+            cleanup_generated_paths(temp_cleanup_paths, console)
+        raise
 
 
 def build_mkvmerge_command_for_temp_mkv(
@@ -4090,7 +4168,7 @@ def build_mkvmerge_command_for_temp_mkv(
     chapters_file: Optional[str] = None,
 ) -> List[str]:
     """构建基于单个临时 MKV 输入的 mkvmerge 命令。"""
-    cmd = [find_executable("mkvmerge") or "mkvmerge", "-o", output_path]
+    cmd = [require_executable("mkvmerge"), "-o", output_path]
     _append_mkvmerge_title_and_chapters(cmd, title, chapters_file)
 
     _append_mkvmerge_track_selection_with_resolver(cmd, tracks, lambda track: int(track_sources[track.id]["track_id"]))
@@ -4159,6 +4237,7 @@ def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
     output_chunks = []
     progress_patterns = [
         re.compile(r"^(analyze|process):\s+\d+%$", re.IGNORECASE),
+        re.compile(r"^progress:\s*\d+%$", re.IGNORECASE),
         re.compile(r"^进度:\s*\d+%$"),
         re.compile(r"^\d+\s*%\s*$"),
     ]
@@ -4168,25 +4247,34 @@ def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
         stripped = text.strip()
         return any(pattern.match(stripped) for pattern in progress_patterns)
 
-    if process.stdout:
-        for line in process.stdout:
-            if _is_progress_line(line):
-                sys.stdout.write("\r" + line.strip())
-                sys.stdout.flush()
-                last_line_was_progress = True
-            else:
-                if last_line_was_progress:
-                    sys.stdout.write("\n")
+    try:
+        if process.stdout:
+            for line in process.stdout:
+                if _is_progress_line(line):
+                    sys.stdout.write("\r" + line.strip())
                     sys.stdout.flush()
-                    last_line_was_progress = False
-                print(line, end="")
-            output_chunks.append(line)
+                    last_line_was_progress = True
+                else:
+                    if last_line_was_progress:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        last_line_was_progress = False
+                    print(line, end="")
+                output_chunks.append(line)
 
-    if last_line_was_progress:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        if last_line_was_progress:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
-    return process.wait(), "".join(output_chunks)
+        return process.wait(), "".join(output_chunks)
+    except BaseException:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        raise
 
 
 def _run_command_with_status(
@@ -4501,7 +4589,7 @@ _CHANNEL_MAP = {1: "1.0", 2: "2.0", 6: "5.1", 7: "6.1", 8: "7.1"}
 
 def scan_tracks_with_ffprobe(m2ts_path: Path, chapter: Chapter) -> List[Track]:
     """使用 ffprobe 扫描轨道"""
-    cmd = [find_executable("ffprobe") or "ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(m2ts_path)]
+    cmd = [require_executable("ffprobe"), "-v", "error", "-show_streams", "-show_format", "-of", "json", str(m2ts_path)]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8")
@@ -5702,6 +5790,7 @@ def workflow_phase6_extract_metadata(bdmv_path: Path, chapter: Chapter, output_d
 
 def workflow_phase7_remux(
     output_dir: Path,
+    temp_dir: Optional[Path],
     mpls_path: Path,
     tracks: List[Track],
     title: str,
@@ -5717,6 +5806,7 @@ def workflow_phase7_remux(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{title}.mkv"
+    effective_temp_dir = temp_dir or (output_dir / "temp")
 
     console.print(f"输出文件：{output_file}")
     track_sources: Dict[int, Dict[str, Any]] = {}
@@ -5731,7 +5821,7 @@ def workflow_phase7_remux(
                 title,
                 source_tracks,
                 tracks,
-                output_dir,
+                effective_temp_dir,
                 reuse_existing=keep_temp,
                 console=console,
             )
@@ -5740,6 +5830,7 @@ def workflow_phase7_remux(
                 tracks[:] = effective_tracks
             generated_paths = collect_generated_paths(track_sources, effective_chapters_file)
             generated_paths.add(temp_mkv_path.parent)
+            generated_paths.add(temp_mkv_path.parent.parent)
             cmd = build_mkvmerge_command_for_temp_mkv(
                 output_path=str(output_file),
                 temp_mkv_path=temp_mkv_path,
@@ -5786,6 +5877,7 @@ def workflow_phase7_remux(
 def main_workflow(
     bdmv_path: Path,
     output_dir: Path,
+    temp_dir: Optional[Path] = None,
     bdinfo_path: Optional[Path] = None,
     original_lang: str = "eng",
     skip_interactive: bool = False,
@@ -5801,6 +5893,7 @@ def main_workflow(
     Args:
         bdmv_path: BDMV 目录的 Path 对象
         output_dir: 最终 MKV 输出目录
+        temp_dir: 问题盘 MakeMKV 临时目录（未指定时使用当前原盘 output_dir / "temp"）
         bdinfo_path: 对应的 BDInfo 文本路径（可选）
         original_lang: 原语言代码（默认 "eng"）
         skip_interactive: 是否跳过交互式编辑阶段
@@ -5903,6 +5996,7 @@ def main_workflow(
     initial_processing_mode = processing_decision.get("processing_mode")
     success, processing_decision = workflow_phase7_remux(
         output_dir,
+        temp_dir,
         mpls_path,
         final_tracks,
         title,
@@ -5918,6 +6012,7 @@ def main_workflow(
         console.print("[yellow]切换到问题盘兜底路径后重试 Remux...[/yellow]")
         success, processing_decision = workflow_phase7_remux(
             output_dir,
+            temp_dir,
             mpls_path,
             final_tracks,
             title,
@@ -5974,6 +6069,7 @@ def parse_arguments():
     # 可选参数
     parser.add_argument("--bdinfo-dir", type=str, default=None, help="统一 BDInfo 目录（可选，也支持同名 bdinfo.txt）")
     parser.add_argument("-o", "--output", type=str, default="./output", help="输出基础目录（默认：./output）")
+    parser.add_argument("-t", "--temp", type=str, default=None, help="问题盘 MakeMKV 临时目录（未指定时使用每个原盘输出目录下的 temp）")
     parser.add_argument("--skip-interactive", action="store_true", help="跳过交互式编辑（全自动批量处理）")
     parser.add_argument("--continue-on-error", action="store_true", help="遇到错误时继续处理下一个原盘")
     parser.add_argument("--commentary", type=str, choices=["keep", "drop", "ask"], default=None, help="导评策略 (keep保留/drop丢弃/ask单盘询问)")
@@ -6235,12 +6331,19 @@ def _preconfirm_single_disc(
     # 处理 ISO 或目录源
     bdmv_path = _process_iso_source(source, mount_manager, console) if source["type"] == "iso" else source["bdmv_path"]
 
+    preferred_playlist = _extract_bdinfo_playlist_name(task["bdinfo_path"])
     auto_skip_mpls = True
     while True:
         # 1. 扫描 MPLS 并选择正片
         console.print("\n[cyan]→ 扫描 MPLS 文件[/cyan]")
         try:
-            chapter, mpls_path = select_main_playlist(bdmv_path, console, source["name"], auto_skip=auto_skip_mpls)
+            chapter, mpls_path = select_main_playlist(
+                bdmv_path,
+                console,
+                source["name"],
+                auto_skip=auto_skip_mpls,
+                preferred_playlist=preferred_playlist,
+            )
         except RuntimeError:
             console.print(f"[red]✗ {source['name']} - 未找到符合条件的正片 MPLS[/red]")
             task["preconfirm_error"] = "未找到正片 MPLS"
@@ -6420,6 +6523,7 @@ def batch_phase3_5_preconfirm(
 def _run_single_remux_task(
     task: Dict,
     output_dir: Path,
+    temp_dir: Optional[Path],
     skip_interactive: bool,
     global_drop_commentary: Optional[bool],
     global_keep_best_audio: Optional[bool],
@@ -6464,6 +6568,7 @@ def _run_single_remux_task(
     bdmv_path = _process_iso_source(source, mount_manager, console) if source["type"] == "iso" else source["bdmv_path"]
 
     movie_output_dir = output_dir / sanitize_filename(source["name"])
+    movie_temp_dir = temp_dir / sanitize_filename(source["name"]) if temp_dir else None
 
     # 判断是否使用预确认配置
     if "preconfirm_config" in task:
@@ -6473,6 +6578,7 @@ def _run_single_remux_task(
         result = main_workflow(
             bdmv_path=bdmv_path,
             output_dir=movie_output_dir,
+            temp_dir=movie_temp_dir,
             bdinfo_path=task["bdinfo_path"],
             original_lang=task["original_lang"],
             skip_interactive=True,
@@ -6509,6 +6615,7 @@ def _run_single_remux_task(
         result = main_workflow(
             bdmv_path=bdmv_path,
             output_dir=movie_output_dir,
+            temp_dir=movie_temp_dir,
             bdinfo_path=task["bdinfo_path"],
             original_lang=task["original_lang"],
             skip_interactive=skip_interactive,
@@ -6536,6 +6643,7 @@ def _run_single_remux_task(
 def batch_phase4_remux(
     tasks: List[Dict],
     output_dir: Path,
+    temp_dir: Optional[Path],
     skip_interactive: bool,
     continue_on_error: bool,
     global_drop_commentary: Optional[bool],
@@ -6585,6 +6693,7 @@ def batch_phase4_remux(
                 status = _run_single_remux_task(
                     task,
                     output_dir,
+                    temp_dir,
                     skip_interactive,
                     global_drop_commentary,
                     global_keep_best_audio,
@@ -6683,6 +6792,7 @@ def main():
     # 清理路径参数
     root_dir = clean_path(args.input)
     output_dir = clean_path(args.output)
+    temp_dir = clean_path(args.temp) if args.temp else None
     bdinfo_dir = clean_path(args.bdinfo_dir) if args.bdinfo_dir else None
 
     # 验证路径
@@ -6692,6 +6802,10 @@ def main():
 
     if bdinfo_dir and not bdinfo_dir.exists():
         console.print(f"[red]错误：BDInfo 目录不存在：{bdinfo_dir}[/red]")
+        sys.exit(1)
+
+    if temp_dir and temp_dir.exists() and not temp_dir.is_dir():
+        console.print(f"[red]错误：临时目录不是目录：{temp_dir}[/red]")
         sys.exit(1)
 
     # 执行批量处理流程
@@ -6771,6 +6885,7 @@ def main():
         success_count, failed_count, skipped_count = batch_phase4_remux(
             tasks,
             output_dir,
+            temp_dir,
             args.skip_interactive,
             args.continue_on_error,
             global_drop_commentary,

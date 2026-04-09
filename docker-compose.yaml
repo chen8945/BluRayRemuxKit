@@ -2,7 +2,6 @@ services:
   remuxkit:
     image: ghcr.io/chen8945/bluray-remuxkit:latest
     container_name: bluray-remuxkit
-    network_mode: none
     init: true
     stdin_open: true
     tty: true
@@ -23,5 +22,6 @@ services:
     volumes:
       - ./input:/input:ro
       - ./output:/output
+      - ./temp:/temp
     tmpfs:
       - /tmp:exec
