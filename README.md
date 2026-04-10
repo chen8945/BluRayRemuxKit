@@ -19,6 +19,7 @@
 | `--simplify-subs` | 否 | `ask` | 外语字幕精简策略（`yes` 默认精简外语 / `no` 全部保留 / `ask` 询问） |
 | `--skip-interactive` | 否 | — | 开启全自动静默模式，跳过所有手动确认和轨道编辑环节 |
 | `--continue-on-error`| 否 | — | 容错模式，某个原盘处理报错时自动跳过并继续处理下一个 |
+| `--delete-source` | 否 | — | 处理成功后自动删除原盘源文件 (ISO/BDMV) 及 BDInfo 文本释放空间 (谨慎使用) |
 | `--keep-temp` | 否 | — | 保留并复用 `MakeMKV` 产出的临时 MKV（测试使用，请勿开启） |
 | `--debug` | 否 | — | 输出轨道补全、MakeMKV 回绑匹配、mkvmerge 命令与处理路径等调试信息（测试使用，请勿开启） |
 
@@ -128,6 +129,37 @@ docker pull ghcr.io/chen8945/bluray-remuxkit:latest
 2. 直接粘贴执行以下命令：
 3. 如果运行过程中提示缺少 BDInfo，就把完整 BDInfo 文本粘贴进控制台，并单独输入 `EOF` 结束。
 
+
+#### 自动删除原盘
+```bash
+docker run --rm -it \
+  --init \
+  --security-opt apparmor:unconfined \
+  --security-opt seccomp:unconfined \
+  --cap-add SYS_ADMIN \
+  --device /dev/loop-control:/dev/loop-control \
+  --device /dev/loop0:/dev/loop0 \
+  --device /dev/loop1:/dev/loop1 \
+  --device /dev/loop2:/dev/loop2 \
+  --device /dev/loop3:/dev/loop3 \
+  --device /dev/loop4:/dev/loop4 \
+  --device /dev/loop5:/dev/loop5 \
+  --tmpfs /tmp:exec \
+  -v "$PWD":/input:ro \
+  -v "$PWD/../Remux_Output":/output \
+  -v "$PWD/../Remux_Temp":/temp \
+  ghcr.io/chen8945/bluray-remuxkit:latest \
+  -i /input \
+  -o /output \
+  -t /temp \
+  --continue-on-error \
+  --delete-source \
+  --commentary drop \
+  --best-audio yes \
+  --simplify-subs yes
+```
+
+#### 保留原盘
 ```bash
 docker run --rm -it \
   --init \
@@ -154,6 +186,7 @@ docker run --rm -it \
   --best-audio yes \
   --simplify-subs yes
 ```
+
 > **巧妙的路径隔离**：通过 `-v "$PWD/../Remux_Output":/output` 与 `-v "$PWD/../Remux_Temp":/temp`，可以把最终输出与问题盘临时文件分开存放在当前目录的**上一级目录**中。
 
 ### 使用 Docker Compose
@@ -203,6 +236,20 @@ docker compose run --rm remuxkit \
   --best-audio yes \
   --simplify-subs yes \
   --continue-on-error
+```
+
+**6. 边转边删模式（空间回收）**（全自动+成功后立刻删除原盘及 BDInfo，适合小硬盘）：
+```bash
+docker compose run --rm remuxkit \
+  -i /input \
+  -o /output \
+  -t /temp \
+  --skip-interactive \
+  --commentary drop \
+  --best-audio yes \
+  --simplify-subs yes \
+  --continue-on-error \
+  --delete-source
 ```
 
 > ⚠️ **注意**：请务必使用 `docker compose run --rm` 而非 `docker compose up`，因为本容器设计为一次性处理任务，`--rm` 能确保任务结束后自动清理容器。

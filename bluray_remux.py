@@ -8,6 +8,7 @@ Blu-ray Remux Script
 - 自动识别正片、章节、音轨和字幕
 - 整合 BDInfo 信息并支持交互式轨道编辑
 - 支持批量处理和跨平台 ISO 挂载
+- 支持 Remux 成功后安全清理原盘源文件及对应 BDInfo
 
 详细参数、使用示例和 BDInfo 输入方式请见 README.md。
 
@@ -66,8 +67,8 @@ NO_WINDOW_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32
 CUSTOM_PATHS = {
     "mkvmerge": "",
     "ffprobe": "",
-    "makemkvcon": "D:/MakeMKV/makemkvcon64.exe",
-    "MakeMKVProfile": "D:/MakeMKV/KeepAll.mmcp.xml",
+    "makemkvcon": "",
+    "MakeMKVProfile": "",
 }
 
 # 音轨编码权重（用于轨道排序）
@@ -6051,16 +6052,6 @@ def parse_arguments():
         description="Blu-ray Batch Remux Script - 批量蓝光原盘 Remux 工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-示例：
-  # 批量处理目录中的所有原盘
-  python bluray_remux.py -i /path/to/BluRays --bdinfo-dir /path/to/bdinfos -o /output
-
-  # 跳过交互式编辑（全自动）
-  python bluray_remux.py -i /path/to/BluRays -o /output --skip-interactive
-
-  # 自动丢弃导评，并且每种语言只保留最高规格音轨
-  python bluray_remux.py -i /path/to/BluRays -o /output --commentary drop --best-audio yes
-
         """,
     )
 
@@ -6079,6 +6070,7 @@ def parse_arguments():
     parser.add_argument(
         "--simplify-subs", type=str, choices=["no", "yes", "ask"], default=None, help="精简外语字幕 (yes仅留最优/no保留所有/ask单盘询问)"
     )
+    parser.add_argument("--delete-source", action="store_true", help="处理成功后自动删除原盘文件 (ISO 或文件夹) (谨慎使用)")
     parser.add_argument("--keep-temp", action="store_true", help="保留并复用问题盘 MakeMKV 临时 MKV（测试用，请勿开启）")
     parser.add_argument("--debug", action="store_true", help="输出轨道补全、MakeMKV 回绑与封装调试信息（测试用，请勿开启）")
     return parser.parse_args()
@@ -6649,6 +6641,7 @@ def batch_phase4_remux(
     global_drop_commentary: Optional[bool],
     global_keep_best_audio: Optional[bool],
     global_simplify_subs: Optional[bool],
+    delete_source: bool,
     keep_temp: bool,
     console: Console,
 ) -> Tuple[int, int, int]:
@@ -6658,11 +6651,14 @@ def batch_phase4_remux(
     Args:
         tasks: 任务列表（会被原地修改，更新 status 字段）
         output_dir: 输出基础目录
+        temp_dir: 问题盘临时处理目录
         skip_interactive: 跳过交互式编辑
         continue_on_error: 遇到错误是否继续
         global_drop_commentary: 全局导评策略
         global_keep_best_audio: 全局音轨精简策略
         global_simplify_subs: 全局外语字幕精简策略
+        delete_source: 处理成功后是否自动删除原盘文件及对应 BDInfo（危险操作）
+        keep_temp: 是否保留临时文件
         console: Rich Console对象
 
     Returns:
@@ -6671,7 +6667,8 @@ def batch_phase4_remux(
     Notes:
         遍历所有任务并执行 main_workflow()
         如果任务有 preconfirm_config，使用预确认配置
-        否则执行正常的交互式流程
+        否则执行正常的交互式流程。
+        如果在参数中启用了 delete_source，会在单个任务返回 success 时立即执行原盘及 BDInfo 文本的清理操作，释放磁盘空间。
     """
     console.print("\n[bold cyan]阶段 4：批量 Remux[/bold cyan]")
 
@@ -6705,6 +6702,32 @@ def batch_phase4_remux(
 
                 if status == "success":
                     success_count += 1
+                    if delete_source:
+                        # 如果是 ISO，必须在删除前提前卸载以解除文件占用
+                        if source["type"] == "iso" and mount_manager:
+                            mount_manager.unmount_last()
+
+                        # 删除原盘文件或文件夹
+                        source_path = source["path"]
+                        try:
+                            console.print(f"[yellow]→ 正在删除原盘文件：{source_path}[/yellow]")
+                            if source_path.is_file():
+                                source_path.unlink()
+                            elif source_path.is_dir():
+                                shutil.rmtree(source_path)
+                            console.print("[green]✓ 原盘已成功删除[/green]")
+                        except Exception as e:
+                            console.print(f"[red]✗ 删除原盘失败：{e}[/red]")
+
+                        # 删除对应的 BDInfo 文件
+                        bdinfo_path = task.get("bdinfo_path")
+                        if bdinfo_path and bdinfo_path.exists() and bdinfo_path.is_file():
+                            try:
+                                console.print(f"[yellow]→ 正在删除对应的 BDInfo 文件：{bdinfo_path}[/yellow]")
+                                bdinfo_path.unlink()
+                                console.print("[green]✓ BDInfo 文件已成功删除[/green]")
+                            except Exception as e:
+                                console.print(f"[red]✗ 删除 BDInfo 文件失败：{e}[/red]")
                 elif status == "failed":
                     failed_count += 1
                     if not continue_on_error:
@@ -6891,6 +6914,7 @@ def main():
             global_drop_commentary,
             global_keep_best_audio,
             global_simplify_subs,
+            args.delete_source,
             args.keep_temp,
             console,
         )
