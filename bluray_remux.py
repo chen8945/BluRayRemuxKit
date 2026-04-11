@@ -134,7 +134,7 @@ SPECIAL_LANGUAGE_NAMES = {
 # 2. 音频地区权重排序：同语言、同编码时按 region 列表顺序排序
 # 3. 字幕地区权重排序：同类型字幕按 region 列表顺序排序
 TRACK_KEYWORDS = {
-    "region": ["八一公映", "长影公映", "公映", "央视长译", "央视", "长译", "东影上译", "东影", "上译", "北影", "中影", "华纳", "六区", "德加拉", "东森", "新索"],  # 地区/版本标识（列表顺序 = 排序优先级）
+    "region": ["八一公映", "长影公映", "公映", "央视长译", "央视", "京译", "长译", "东影上译", "东影", "上译", "北影", "中影", "华纳", "六区", "德加拉", "东森", "新索"],  # 地区/版本标识（列表顺序 = 排序优先级）
     "mandarin": ["国语", "国配"],                     # 国语标识
     "dialect": ["台配", "粤配", "粤语", "港配"],        # 方言标识
     "commentary": ["导评", "评论", "commentary"]      # 导评标识
@@ -487,6 +487,26 @@ TOOL_PROBE_ARGS = {
 DEFAULT_MAKEMKV_PROFILE_NAME = "default.mmcp.xml"
 
 
+def _resolve_path_entry(path_value: Optional[str], candidate_names: List[str], allow_windows_exe: bool = True) -> Optional[Path]:
+    """将配置路径解析为文件路径；支持直接传文件或传目录后按候选名查找。"""
+    if not path_value:
+        return None
+
+    path = clean_path(path_value)
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        return None
+
+    suffixes = ["", ".exe"] if allow_windows_exe and sys.platform.startswith("win") else [""]
+    for candidate_name in candidate_names:
+        for suffix in suffixes:
+            candidate_path = path / f"{candidate_name}{suffix}"
+            if candidate_path.is_file():
+                return candidate_path
+    return None
+
+
 def clean_path(path_str: str) -> Path:
     """
     清理命令行路径参数，并交给 pathlib 做规范化。
@@ -612,30 +632,65 @@ def find_executable(tool_name: str) -> Optional[str]:
     查找可执行文件路径
     优先级：自定义路径 > 脚本目录 > 系统 PATH
     """
+    candidate_names = ["makemkvcon64", "makemkvcon"] if tool_name == "makemkvcon" else [tool_name]
+
     # 1. 检查自定义路径
-    if CUSTOM_PATHS.get(tool_name):
-        custom_path = CUSTOM_PATHS[tool_name]
-        if Path(custom_path).is_file():
-            return custom_path
+    custom_path = _resolve_path_entry(CUSTOM_PATHS.get(tool_name), candidate_names)
+    if custom_path:
+        return str(custom_path)
 
     # 2. 检查脚本目录
-    script_dir = Path(__file__).parent
-    for ext in ["", ".exe"]:
-        local_path = script_dir / f"{tool_name}{ext}"
-        if local_path.is_file():
-            return str(local_path)
+    script_path = _resolve_path_entry(str(Path(__file__).parent), candidate_names)
+    if script_path:
+        return str(script_path)
 
     # 3. 检查系统 PATH
-    return shutil.which(tool_name)
+    for candidate_name in candidate_names:
+        found = shutil.which(candidate_name)
+        if found:
+            return found
+    return None
+
+
+def _resolve_makemkv_profile_entry(path_value: Optional[str]) -> Optional[Path]:
+    """解析 MakeMKV profile 路径。
+
+    规则：
+    1. 传入文件路径时直接使用该文件；
+    2. 传入目录时优先使用 `default.mmcp.xml`；
+    3. 若目录中不存在默认文件，但仅存在一个 `.mmcp.xml`，则使用该文件；
+    4. 其余情况返回 None，避免猜测。
+    """
+    if not path_value:
+        return None
+
+    path = clean_path(path_value)
+    if path.is_file():
+        return path
+    if not path.is_dir():
+        return None
+
+    default_profile_path = path / DEFAULT_MAKEMKV_PROFILE_NAME
+    if default_profile_path.is_file():
+        return default_profile_path
+
+    profile_candidates = sorted(candidate for candidate in path.glob("*.mmcp.xml") if candidate.is_file())
+    if len(profile_candidates) == 1:
+        return profile_candidates[0]
+    return None
 
 
 def get_makemkv_profile_path() -> Optional[Path]:
     """返回 MakeMKV profile 配置文件路径。"""
-    profile_path = os.environ.get("MAKEMKV_PROFILE", "").strip() or CUSTOM_PATHS.get("MakeMKVProfile", "").strip()
-    if not profile_path:
-        return None
-    path = Path(profile_path)
-    return path if path.is_file() else None
+    profile_path = _resolve_makemkv_profile_entry(os.environ.get("MAKEMKV_PROFILE"))
+    if profile_path:
+        return profile_path
+
+    profile_path = _resolve_makemkv_profile_entry(CUSTOM_PATHS.get("MakeMKVProfile"))
+    if profile_path:
+        return profile_path
+
+    return _resolve_makemkv_profile_entry(str(Path(__file__).parent))
 
 
 def require_executable(tool_name: str) -> str:
@@ -1460,6 +1515,10 @@ def parse_subtitle_components(desc: str) -> Dict[str, Optional[str]]:
 
     # 如果不是方言，再检测是否包含国配关键词（国语、普通话能覆盖各种"对照国语/对应普通话"）
     if not components["dubbing"] and any(kw in desc for kw in ["国配", "国语", "普通话"]):
+        components["dubbing"] = "国配"
+
+    # 如果只有地区关键词（如“上译”），但没有明确写“国配”，默认将其判定为国配
+    if not components["dubbing"] and components["region"]:
         components["dubbing"] = "国配"
 
     # 4. 提取简繁标识
@@ -4116,16 +4175,18 @@ def extract_tracks_with_makemkv(
 
     profile_path = get_makemkv_profile_path()
     if profile_path is None:
-        raise RuntimeError("MakeMKV profile 配置文件不可用：请设置 MAKEMKV_PROFILE 并确保其指向存在的 default.mmcp.xml")
+        raise RuntimeError(
+            "MakeMKV profile 配置文件不可用：请设置 MAKEMKV_PROFILE 为配置文件路径，或指向包含 default.mmcp.xml / 唯一 .mmcp.xml 的目录"
+        )
 
     disc_root = _resolve_disc_root_from_mpls(mpls_path)
     info_output = run_makemkv_info_with_robot(disc_root, console=console)
     tinfo = parse_makemkv_tinfo(info_output)
     title_id = select_makemkv_title_by_playlist(tinfo, mpls_path)
 
-    temp_output_dir = temp_dir / title
+    temp_output_dir = temp_dir
     temp_output_dir.mkdir(parents=True, exist_ok=True)
-    temp_cleanup_paths: Set[Path] = {temp_output_dir, temp_dir}
+    temp_cleanup_paths: Set[Path] = {temp_output_dir}
 
     try:
         if not reuse_existing:
@@ -4425,10 +4486,10 @@ def find_bdinfo_for_source(source: Dict, bdinfo_dir: Optional[Path] = None) -> O
 
     匹配策略（按优先级）：
     1. 统一目录优先：bdinfo_dir/{name}.txt 或 bdinfo_dir/{name}_bdinfo.txt
-    2. 本地目录同名匹配：
-       - 若为文件夹：同时查找【文件夹内】与【文件夹同级】的 {name}.txt
-       - 若为 ISO：查找【ISO 同级】的 {name}.txt
-    3. 兜底回溯：从原盘目录向上查找通用名称 bdinfo.txt
+    2. 原盘目录本地匹配：
+       - 若为文件夹：查找【原盘目录内】的 {name}.txt / {name}_bdinfo.txt / bdinfo.txt，
+         同时查找【原盘同级目录】的 {name}.txt / {name}_bdinfo.txt
+       - 若为 ISO：查找【ISO 同级目录】的 {name}.txt / {name}_bdinfo.txt / bdinfo.txt
     """
     path, name = Path(source["path"]), source["name"]
     names = [f"{name}.txt", f"{name}_bdinfo.txt"]
@@ -4438,25 +4499,16 @@ def find_bdinfo_for_source(source: Dict, bdinfo_dir: Optional[Path] = None) -> O
     if bdinfo_dir:
         candidates.extend(bdinfo_dir / n for n in names)
 
-    # 2 & 3. 原盘本地目录匹配
+    # 2. 原盘本地目录匹配
     if path.exists():
-        parent = path.parent
-
         if path.is_dir():
-            # 针对文件夹：检查内部专属文本及通用 bdinfo.txt
+            # 针对文件夹：检查原盘目录内的专属文本及通用 bdinfo.txt
             candidates.extend(path / n for n in names + ["bdinfo.txt"])
-            # 针对文件夹：检查同级专属文本
-            candidates.extend(parent / n for n in names)
+            # 针对文件夹：检查原盘同级目录的专属文本
+            candidates.extend(path.parent / n for n in names)
         else:
             # 针对 ISO：检查同级专属文本及通用 bdinfo.txt
-            candidates.extend(parent / n for n in names + ["bdinfo.txt"])
-
-        # 4. 向上回溯查找通用 bdinfo.txt (最多回溯 3 层)
-        for _ in range(3):
-            if parent.parent == parent:
-                break
-            parent = parent.parent
-            candidates.append(parent / "bdinfo.txt")
+            candidates.extend(path.parent / n for n in names + ["bdinfo.txt"])
 
     # 统一验证：利用 next() 结合生成器进行懒加载验证，返回第一个存在的文件
     return next((c for c in candidates if c.is_file()), None)
@@ -5902,7 +5954,7 @@ def main_workflow(
         drop_commentary: 是否全局剔除导评轨
         keep_best_audio: 是否每种语言仅保留最优音轨
         simplify_subs: 是否精简外语字幕（英语/原语言仅保留排序最优的一条）
-        keep_temp: 是否保留并复用问题盘外部化路径的中间文件
+        keep_temp: 是否保留并复用问题盘外部化路径的中间文件；启用后会忽略 delete_source
         source_name: 原盘名称（可选，传入以便在交互界面的表格中提示用户）
     """
     console = Console()
@@ -6060,7 +6112,7 @@ def parse_arguments():
     # 可选参数
     parser.add_argument("--bdinfo-dir", type=str, default=None, help="统一 BDInfo 目录（可选，也支持同名 bdinfo.txt）")
     parser.add_argument("-o", "--output", type=str, default="./output", help="输出基础目录（默认：./output）")
-    parser.add_argument("-t", "--temp", type=str, default=None, help="问题盘 MakeMKV 临时目录（未指定时使用每个原盘输出目录下的 temp）")
+    parser.add_argument("-t", "--temp", type=str, default=None, help="问题盘 MakeMKV 临时根目录（未指定时使用每个原盘输出目录下的 temp）")
     parser.add_argument("--skip-interactive", action="store_true", help="跳过交互式编辑（全自动批量处理）")
     parser.add_argument("--continue-on-error", action="store_true", help="遇到错误时继续处理下一个原盘")
     parser.add_argument("--commentary", type=str, choices=["keep", "drop", "ask"], default=None, help="导评策略 (keep保留/drop丢弃/ask单盘询问)")
@@ -6071,7 +6123,7 @@ def parse_arguments():
         "--simplify-subs", type=str, choices=["no", "yes", "ask"], default=None, help="精简外语字幕 (yes仅留最优/no保留所有/ask单盘询问)"
     )
     parser.add_argument("--delete-source", action="store_true", help="处理成功后自动删除原盘文件 (ISO 或文件夹) (谨慎使用)")
-    parser.add_argument("--keep-temp", action="store_true", help="保留并复用问题盘 MakeMKV 临时 MKV（测试用，请勿开启）")
+    parser.add_argument("--keep-temp", action="store_true", help="保留并复用问题盘 MakeMKV 临时 MKV，并强制保留源文件与 BDInfo（测试用，请勿开启）")
     parser.add_argument("--debug", action="store_true", help="输出轨道补全、MakeMKV 回绑与封装调试信息（测试用，请勿开启）")
     return parser.parse_args()
 
@@ -6129,19 +6181,36 @@ def batch_phase2_match_bdinfo(sources: List[Dict], bdinfo_dir: Optional[Path], c
 
     for source in sources:
         bdinfo_path = find_bdinfo_for_source(source, bdinfo_dir)
+        cleanup_bdinfo_path = None
 
         if bdinfo_path is None:
             if stdin_is_tty:
                 bdinfo_path = prompt_for_missing_bdinfo_text(source["name"], console)
+                cleanup_bdinfo_path = bdinfo_path
 
             if bdinfo_path is None:
                 console.print(f"[yellow]警告：未找到 BDInfo - {source['name']}[/yellow]")
                 console.print("  [dim]→ 已自动忽略该原盘，将不参与本次后续处理[/dim]")
                 continue
 
+        if bdinfo_path and bdinfo_path.is_file():
+            source_path = Path(source["path"])
+            if source["type"] == "iso":
+                cleanup_bdinfo_path = bdinfo_path
+            elif bdinfo_path.parent != source_path:
+                cleanup_bdinfo_path = bdinfo_path
+
         original_lang = infer_original_lang_from_bdinfo(bdinfo_path)
 
-        tasks.append({"source": source, "bdinfo_path": bdinfo_path, "original_lang": original_lang, "status": "pending"})
+        tasks.append(
+            {
+                "source": source,
+                "bdinfo_path": bdinfo_path,
+                "cleanup_bdinfo_path": cleanup_bdinfo_path,
+                "original_lang": original_lang,
+                "status": "pending",
+            }
+        )
 
     if not tasks:
         console.print("[red]错误：没有可处理的任务（所有原盘均缺少 BDInfo）[/red]")
@@ -6559,8 +6628,9 @@ def _run_single_remux_task(
     # 处理 ISO 或目录源
     bdmv_path = _process_iso_source(source, mount_manager, console) if source["type"] == "iso" else source["bdmv_path"]
 
-    movie_output_dir = output_dir / sanitize_filename(source["name"])
-    movie_temp_dir = temp_dir / sanitize_filename(source["name"]) if temp_dir else None
+    source_output_name = sanitize_filename(source["name"])
+    movie_output_dir = output_dir / source_output_name
+    movie_temp_dir = (temp_dir / source_output_name) if temp_dir else (movie_output_dir / "temp")
 
     # 判断是否使用预确认配置
     if "preconfirm_config" in task:
@@ -6657,8 +6727,8 @@ def batch_phase4_remux(
         global_drop_commentary: 全局导评策略
         global_keep_best_audio: 全局音轨精简策略
         global_simplify_subs: 全局外语字幕精简策略
-        delete_source: 处理成功后是否自动删除原盘文件及对应 BDInfo（危险操作）
-        keep_temp: 是否保留临时文件
+        delete_source: 处理成功后是否自动删除原盘文件及当前任务绑定的 BDInfo 缓存（危险操作）
+        keep_temp: 是否保留临时文件；启用后会忽略 delete_source
         console: Rich Console对象
 
     Returns:
@@ -6668,7 +6738,8 @@ def batch_phase4_remux(
         遍历所有任务并执行 main_workflow()
         如果任务有 preconfirm_config，使用预确认配置
         否则执行正常的交互式流程。
-        如果在参数中启用了 delete_source，会在单个任务返回 success 时立即执行原盘及 BDInfo 文本的清理操作，释放磁盘空间。
+        如果在参数中启用了 delete_source，会在单个任务返回 success 时立即执行原盘清理，并删除当前任务绑定的本地 BDInfo 或临时 BDInfo 缓存。
+        如果 keep_temp 为 True，则会强制保留源文件、BDInfo 与临时产物，忽略 delete_source。
     """
     console.print("\n[bold cyan]阶段 4：批量 Remux[/bold cyan]")
 
@@ -6702,7 +6773,7 @@ def batch_phase4_remux(
 
                 if status == "success":
                     success_count += 1
-                    if delete_source:
+                    if delete_source and not keep_temp:
                         # 如果是 ISO，必须在删除前提前卸载以解除文件占用
                         if source["type"] == "iso" and mount_manager:
                             mount_manager.unmount_last()
@@ -6719,12 +6790,12 @@ def batch_phase4_remux(
                         except Exception as e:
                             console.print(f"[red]✗ 删除原盘失败：{e}[/red]")
 
-                        # 删除对应的 BDInfo 文件
-                        bdinfo_path = task.get("bdinfo_path")
-                        if bdinfo_path and bdinfo_path.exists() and bdinfo_path.is_file():
+                        # 仅删除当前任务预先绑定的可清理 BDInfo
+                        cleanup_bdinfo_path = task.get("cleanup_bdinfo_path")
+                        if cleanup_bdinfo_path and cleanup_bdinfo_path.exists() and cleanup_bdinfo_path.is_file():
                             try:
-                                console.print(f"[yellow]→ 正在删除对应的 BDInfo 文件：{bdinfo_path}[/yellow]")
-                                bdinfo_path.unlink()
+                                console.print(f"[yellow]→ 正在删除对应的 BDInfo 文件：{cleanup_bdinfo_path}[/yellow]")
+                                cleanup_bdinfo_path.unlink()
                                 console.print("[green]✓ BDInfo 文件已成功删除[/green]")
                             except Exception as e:
                                 console.print(f"[red]✗ 删除 BDInfo 文件失败：{e}[/red]")
@@ -6830,6 +6901,9 @@ def main():
     if temp_dir and temp_dir.exists() and not temp_dir.is_dir():
         console.print(f"[red]错误：临时目录不是目录：{temp_dir}[/red]")
         sys.exit(1)
+
+    if args.keep_temp and args.delete_source:
+        console.print("[yellow]提示：已启用 --keep-temp，脚本将忽略 --delete-source 并强制保留源文件、BDInfo 与临时文件。[/yellow]")
 
     # 执行批量处理流程
     try:

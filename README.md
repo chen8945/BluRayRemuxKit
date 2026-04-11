@@ -12,15 +12,15 @@
 |---|---|---|---|
 | `-i`, `--input` | **是** | — | 包含蓝光原盘（文件夹）或 ISO 文件的根目录，支持递归扫描多层子目录 |
 | `-o`, `--output` | 否 | `./output` | 输出 MKV 文件的保存目录 |
-| `-t`, `--temp` | 否 | — | `MakeMKV` 临时目录；未指定时默认使用 `<输出目录>/<原盘目录>/temp/<标题>/` |
+| `-t`, `--temp` | 否 | — | `MakeMKV` 临时根目录；未指定时默认使用 `<输出目录>/<原盘目录>/temp/` |
 | `--bdinfo-dir` | 否 | — | 外部 BDInfo 文本的统一存放目录 |
 | `--commentary` | 否 | `ask` | 导评轨道处理策略（`keep` 保留 / `drop` 剔除 / `ask` 询问） |
 | `--best-audio` | 否 | `ask` | 最高规格音轨精简策略（交互询问时默认 `yes`；`no` 保留全部 / `yes` 仅保留最高规格 / `ask` 询问） |
 | `--simplify-subs` | 否 | `ask` | 外语字幕精简策略（`yes` 默认精简外语 / `no` 全部保留 / `ask` 询问） |
 | `--skip-interactive` | 否 | — | 开启全自动静默模式，跳过所有手动确认和轨道编辑环节 |
 | `--continue-on-error`| 否 | — | 容错模式，某个原盘处理报错时自动跳过并继续处理下一个 |
-| `--delete-source` | 否 | — | 处理成功后自动删除原盘源文件 (ISO/BDMV) 及 BDInfo 文本释放空间 (谨慎使用) |
-| `--keep-temp` | 否 | — | 保留并复用 `MakeMKV` 产出的临时 MKV（测试使用，请勿开启） |
+| `--delete-source` | 否 | — | 处理成功后自动删除原盘源文件 (ISO/BDMV)，并删除当前任务匹配到的 BDInfo 文件或控制台粘贴生成的临时 BDInfo 缓存 (谨慎使用，请务必记得把映射中的 `:ro` 删除) |
+| `--keep-temp` | 否 | — | 保留并复用 `MakeMKV` 产出的临时 MKV，并强制保留源文件与 BDInfo（测试使用，请勿开启） |
 | `--debug` | 否 | — | 输出轨道补全、MakeMKV 回绑匹配、mkvmerge 命令与处理路径等调试信息（测试使用，请勿开启） |
 
 > **💡 路径参数提示：**
@@ -53,7 +53,7 @@
   - 初始工作集合会自动剔除隐藏轨（BDInfo `*` 或 hidden hint）。
   - 可在交互 `all` 视图中通过 `add` 手动加回。
   - 但问题盘 MakeMKV 路径会在最终回绑阶段再次忽略隐藏轨，避免匹配失败。
-- `--keep-temp` 未开启时，问题盘流程结束后会自动清理临时 MKV，以及空的标题临时目录和 `temp/` 目录。
+- `--keep-temp` 未开启时，问题盘流程结束后会自动清理临时 MKV，以及空的临时目录。
 
 ### `--skip-interactive` 选片规则
 - 静默模式下，会优先使用 BDInfo 中的 `PLAYLIST` 命中目标 `mpls`。
@@ -63,10 +63,9 @@
 ## BDInfo 匹配与输入
 
 ### 匹配规则（按优先级）
-1. **同名优先** — 在原盘同目录下查找 `{原盘名}.txt` 或 `{原盘名}_bdinfo.txt`
-2. **向上回溯** — 从原盘所在目录开始，向上最多回溯 3 层查找 `bdinfo.txt`
-3. **统一目录** — 在 `--bdinfo-dir` 参数指定的目录下查找同名 txt
-4. **控制台粘贴兜底** — 如果以上位置都没找到 BDInfo，脚本会在交互终端中提示你直接粘贴完整 BDInfo 文本，并缓存成临时 txt 继续处理
+1. **统一目录优先** — 在 `--bdinfo-dir` 参数指定的目录下查找 `{原盘名}.txt` 或 `{原盘名}_bdinfo.txt`
+2. **原盘目录匹配** — 在原盘目录中查找 `{原盘名}.txt`、`{原盘名}_bdinfo.txt` 或 `bdinfo.txt`；如果原盘是文件夹，也支持查找同级的 `{原盘名}.txt` 或 `{原盘名}_bdinfo.txt`
+3. **控制台粘贴兜底** — 如果以上位置都没找到 BDInfo，脚本会在交互终端中提示你直接粘贴完整 BDInfo 文本，并缓存成临时 txt 继续处理
 
 ### 推荐方式：直接在控制台粘贴
 正常情况下不再需要手动新建 `txt` 文件。
@@ -127,7 +126,7 @@ docker pull ghcr.io/chen8945/bluray-remuxkit:latest
 **操作流：**
 1. 在终端中 `cd` 进入包含蓝光原盘的目录（注意这里是指多个原盘的存放目录，而不是指单个原盘目录内部，也就是不要进入 BDMV 同级目录）。
 2. 直接粘贴执行以下命令：
-3. 如果运行过程中提示缺少 BDInfo，就把完整 BDInfo 文本粘贴进控制台，并单独输入 `EOF` 结束。
+3. 如果运行过程中提示缺少 BDInfo，就把完整 BDInfo 文本粘贴进控制台，并在回车换行后单独输入大写 `EOF` 结束。
 
 
 #### 自动删除原盘
@@ -145,7 +144,7 @@ docker run --rm -it \
   --device /dev/loop4:/dev/loop4 \
   --device /dev/loop5:/dev/loop5 \
   --tmpfs /tmp:exec \
-  -v "$PWD":/input:ro \
+  -v "$PWD":/input \
   -v "$PWD/../Remux_Output":/output \
   -v "$PWD/../Remux_Temp":/temp \
   ghcr.io/chen8945/bluray-remuxkit:latest \
@@ -193,6 +192,8 @@ docker run --rm -it \
 
 如果更喜欢统一部署和管理，可以使用 Compose 模式。
 
+如果需要自动删除原盘源文件，请自行添加 `--delete-source` 参数，并把 `docker-compose.yaml` 中的 `./input:/input:ro` 改成可写挂载，例如 `./input:/input`，否则容器内无法删除原盘源文件。
+
 **1. 准备目录结构：**
 ```text
 BluRayRemuxKit/
@@ -238,7 +239,7 @@ docker compose run --rm remuxkit \
   --continue-on-error
 ```
 
-**6. 边转边删模式（空间回收）**（全自动+成功后立刻删除原盘及 BDInfo，适合小硬盘）：
+**6. 边转边删模式（空间回收）**（全自动+成功后立刻删除原盘，并删除当前任务匹配到的 BDInfo，适合小硬盘）：
 ```bash
 docker compose run --rm remuxkit \
   -i /input \
@@ -254,7 +255,7 @@ docker compose run --rm remuxkit \
 
 > ⚠️ **注意**：请务必使用 `docker compose run --rm` 而非 `docker compose up`，因为本容器设计为一次性处理任务，`--rm` 能确保任务结束后自动清理容器。
 >
-> **调试建议**：`--keep-temp` 与 `--debug` 仅用于测试场景，常规批处理请勿开启。
+> **调试建议**：`--keep-temp` 与 `--debug` 仅用于测试场景，常规批处理请勿开启。若同时传入 `--keep-temp` 与 `--delete-source`，会以 `--keep-temp` 为准，强制保留源文件、BDInfo 与临时文件。
 
 ### ISO 挂载排错说明
 容器内 ISO 挂载需要特定的高级权限（`docker-compose.yaml` 及上方单行命令已预置）：
