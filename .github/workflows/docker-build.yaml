@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: chen8945/BluRay-RemuxKit
+  IMAGE_NAME: chen8945/bluRay-remuxkit
 
 jobs:
   build:
