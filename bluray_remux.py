@@ -35,6 +35,7 @@ import mimetypes
 import unicodedata
 import pycountry
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple
@@ -478,6 +479,88 @@ def _parse_tri_state(value: str, true_val: str, ask_val: str = "ask") -> Optiona
     return False
 
 
+class FatalCliError(RuntimeError):
+    """用于把底层 CLI 致命错误上抛到 main() 统一退出。"""
+
+
+class UserAbortError(RuntimeError):
+    """用于表示用户主动取消当前 CLI 流程。"""
+
+
+@dataclass(frozen=True)
+class BDInfoParseOutcome:
+    """BDInfo 解析结果及其后续流程动作。"""
+
+    action: Literal["continue", "reselect_mpls", "skip_disc"]
+    data: Optional[Dict[str, Any]] = None
+
+
+@dataclass(frozen=True)
+class DiscFilterPolicy:
+    """单盘轨道过滤策略。"""
+
+    drop_commentary: bool
+    keep_best_audio: bool
+    simplify_subs: bool
+
+
+@dataclass(frozen=True)
+class PreparedDiscSession:
+    """单盘在进入元数据提取与 Remux 前的准备结果。"""
+
+    chapter: "Chapter"
+    mpls_path: Path
+    processing_decision: Dict[str, Any]
+    source_tracks: List[Any]
+    final_tracks: List[Any]
+
+
+@dataclass(frozen=True)
+class DiscPreparationResult:
+    """共享单盘准备流程的返回结果。"""
+
+    action: Literal["ready", "skip_disc", "playlist_back", "error"]
+    session: Optional[PreparedDiscSession] = None
+    error: Optional[str] = None
+
+
+def resolve_disc_filter_policy(
+    source_name: Optional[str],
+    skip_interactive: bool,
+    global_drop_commentary: Optional[bool],
+    global_keep_best_audio: Optional[bool],
+    global_simplify_subs: Optional[bool],
+    console: Console,
+) -> DiscFilterPolicy:
+    """统一解析单盘过滤策略，减少批量预确认与正式处理的重复逻辑。"""
+    if source_name and not skip_interactive:
+        console.print(f"\n[cyan]→ {source_name} 轨道过滤策略[/cyan]")
+
+    drop_commentary = global_drop_commentary
+    if drop_commentary is None and not skip_interactive:
+        drop_commentary = not Confirm.ask("[yellow]是否保留该原盘的导评音轨和字幕？[/yellow]", default=True)
+    elif drop_commentary is None:
+        drop_commentary = False
+
+    keep_best_audio = global_keep_best_audio
+    if keep_best_audio is None and not skip_interactive:
+        keep_best_audio = Confirm.ask("[yellow]是否为该原盘每种语言仅保留一条最高规格音轨？[/yellow]", default=True)
+    elif keep_best_audio is None:
+        keep_best_audio = False
+
+    simplify_subs = global_simplify_subs
+    if simplify_subs is None and not skip_interactive:
+        simplify_subs = Confirm.ask("[yellow]是否精简该原盘的外语字幕（仅保留一条最优）？[/yellow]", default=True)
+    elif simplify_subs is None:
+        simplify_subs = True
+
+    return DiscFilterPolicy(
+        drop_commentary=drop_commentary,
+        keep_best_audio=keep_best_audio,
+        simplify_subs=simplify_subs,
+    )
+
+
 TOOL_PROBE_ARGS = {
     "mkvmerge": ["--version"],
     "ffprobe": ["-version"],
@@ -775,7 +858,7 @@ def check_tools() -> None:
     statuses = _collect_tool_status(["mkvmerge", "ffprobe"])
     if _tool_status_has_error(statuses):
         _print_tool_status_errors(console, statuses, "必需")
-        sys.exit(1)
+        raise FatalCliError("必需工具不可用")
     console.print("[green]✓ 工具链检查通过[/green]")
 
 
@@ -4312,9 +4395,7 @@ def cleanup_generated_paths(
         failed_names = ", ".join(path.name for path in failed_paths[:5])
         more_count = len(failed_paths) - 5
         suffix = f" 等另外 {more_count} 项" if more_count > 0 else ""
-        console.print(
-            f"[yellow]⚠ 以下中间产物暂未清理成功，可能仍被其他进程占用，可稍后重试或手动删除：{failed_names}{suffix}[/yellow]"
-        )
+        console.print(f"[yellow]⚠ 以下中间产物暂未清理成功，可能仍被其他进程占用，可稍后重试或手动删除：{failed_names}{suffix}[/yellow]")
     return failed_paths
 
 
@@ -5135,7 +5216,7 @@ def scan_main_tracks(bdmv_path: Path, chapter: Chapter, console: Console, verbos
     return tracks
 
 
-def parse_bdinfo_optional(bdinfo_path: Optional[Path], mpls_name: str, console: Console, verify_match: bool = True) -> Optional[Dict]:
+def parse_bdinfo_optional(bdinfo_path: Optional[Path], mpls_name: str, console: Console, verify_match: bool = True) -> BDInfoParseOutcome:
     """
     解析 BDInfo 文本（可选，失败时返回 None）
 
@@ -5148,10 +5229,10 @@ def parse_bdinfo_optional(bdinfo_path: Optional[Path], mpls_name: str, console: 
         verify_match: 是否验证 PLAYLIST 匹配
 
     Returns:
-        BDInfo 数据字典，失败或不存在时返回 None
+        BDInfo 解析结果及后续流程动作
     """
     if not bdinfo_path or not bdinfo_path.exists():
-        return None
+        return BDInfoParseOutcome(action="continue", data=None)
 
     try:
         parser = BDInfoParser(str(bdinfo_path))
@@ -5169,18 +5250,15 @@ def parse_bdinfo_optional(bdinfo_path: Optional[Path], mpls_name: str, console: 
             )
 
             if choice == "1":
-                raise ValueError("RESELECT_MPLS")
-            elif choice == "2":
-                raise ValueError("SKIP_DISC")
+                return BDInfoParseOutcome(action="reselect_mpls", data=None)
+            if choice == "2":
+                return BDInfoParseOutcome(action="skip_disc", data=None)
             # choice == "3" 时什么都不做，顺理成章往下走
 
-        return bdinfo_data
-
-    except ValueError as e:
-        raise e
+        return BDInfoParseOutcome(action="continue", data=bdinfo_data)
     except Exception as e:
         console.print(f"[yellow]警告：BDInfo 解析失败 - {e}[/yellow]")
-        return None
+        return BDInfoParseOutcome(action="continue", data=None)
 
 
 # ==============================================================================
@@ -5194,6 +5272,7 @@ def workflow_phase1_scan_mpls(
     auto_skip: bool = True,
     preferred_playlist: Optional[str] = None,
     force_first_candidate: bool = False,
+    context_name: Optional[str] = None,
 ) -> Tuple[Optional[Chapter], Optional[Path]]:
     """阶段1：扫描 MPLS 文件并选择正片
 
@@ -5213,6 +5292,7 @@ def workflow_phase1_scan_mpls(
     chapter, mpls_path = select_main_playlist(
         bdmv_path,
         console,
+        context_name=context_name,
         auto_skip=auto_skip,
         preferred_playlist=preferred_playlist,
         force_first_candidate=force_first_candidate,
@@ -5223,7 +5303,7 @@ def workflow_phase1_scan_mpls(
     return chapter, mpls_path
 
 
-def workflow_phase2_parse_bdinfo(bdinfo_path: Optional[Path], mpls_name: str, console: Console) -> Optional[Dict]:
+def workflow_phase2_parse_bdinfo(bdinfo_path: Optional[Path], mpls_name: str, console: Console) -> BDInfoParseOutcome:
     """
     阶段2：解析 BDInfo 文本（可选）
 
@@ -5233,15 +5313,16 @@ def workflow_phase2_parse_bdinfo(bdinfo_path: Optional[Path], mpls_name: str, co
         console: Rich Console 对象
 
     Returns:
-        BDInfo 数据字典，失败时返回 None
+        BDInfo 解析结果及后续流程动作
     """
     if not bdinfo_path or not bdinfo_path.exists():
-        return None
+        return BDInfoParseOutcome(action="continue", data=None)
 
     console.print("\n[bold cyan]阶段 2：解析 BDInfo 文本[/bold cyan]")
 
     # 调用公共函数（启用 PLAYLIST 匹配验证）
-    bdinfo_data = parse_bdinfo_optional(bdinfo_path, mpls_name, console, verify_match=True)
+    outcome = parse_bdinfo_optional(bdinfo_path, mpls_name, console, verify_match=True)
+    bdinfo_data = outcome.data
 
     # 显示解析成功的详细信息
     if bdinfo_data:
@@ -5250,10 +5331,10 @@ def workflow_phase2_parse_bdinfo(bdinfo_path: Optional[Path], mpls_name: str, co
         console.print(f"  音轨：{len(bdinfo_data['audio'])} 个")
         console.print(f"  字幕：{len(bdinfo_data['subtitle'])} 个")
 
-    return bdinfo_data
+    return outcome
 
 
-def workflow_phase3_scan_tracks(bdmv_path: Path, chapter: Chapter, console: Console) -> List[Track]:
+def workflow_phase3_scan_tracks(bdmv_path: Path, chapter: Chapter, console: Console, verbose: bool = True) -> List[Track]:
     """
     阶段3：扫描轨道信息
 
@@ -5270,8 +5351,8 @@ def workflow_phase3_scan_tracks(bdmv_path: Path, chapter: Chapter, console: Cons
     """
     console.print("\n[bold cyan]阶段 3：扫描轨道信息[/bold cyan]")
 
-    # 调用公共函数（启用详细输出）
-    return scan_main_tracks(bdmv_path, chapter, console, verbose=True)
+    # 调用公共函数（按需输出详细信息）
+    return scan_main_tracks(bdmv_path, chapter, console, verbose=verbose)
 
 
 def _set_track_flags(track: Track, original_lang: str):
@@ -5799,6 +5880,102 @@ def workflow_phase4_integrate_bdinfo(
     return video_tracks, audio_tracks, subtitle_tracks, view_data
 
 
+def prepare_disc_session(
+    bdmv_path: Path,
+    bdinfo_path: Optional[Path],
+    original_lang: str,
+    drop_commentary: bool,
+    keep_best_audio: bool,
+    simplify_subs: bool,
+    skip_interactive: bool,
+    console: Console,
+    source_name: Optional[str] = None,
+    preferred_playlist: Optional[str] = None,
+    auto_skip_mpls: bool = True,
+    force_first_candidate: bool = False,
+    allow_playlist_back_to_caller: bool = False,
+    scan_tracks_verbose: bool = True,
+) -> DiscPreparationResult:
+    """共享单盘准备流程：选片、解析 BDInfo、扫描轨道、排序并按需交互编辑。"""
+    cli = InteractiveCLI()
+
+    while True:
+        try:
+            chapter, mpls_path = workflow_phase1_scan_mpls(
+                bdmv_path,
+                console,
+                auto_skip=auto_skip_mpls,
+                preferred_playlist=preferred_playlist,
+                force_first_candidate=force_first_candidate,
+                context_name=source_name,
+            )
+        except RuntimeError as exc:
+            return DiscPreparationResult(action="error", error=str(exc))
+
+        if chapter is None or mpls_path is None:
+            if allow_playlist_back_to_caller:
+                return DiscPreparationResult(action="playlist_back")
+            console.print("[yellow]已经是第一步，无法返回[/yellow]")
+            auto_skip_mpls = False
+            continue
+
+        bdinfo_outcome = workflow_phase2_parse_bdinfo(bdinfo_path, mpls_path.name, console)
+        if bdinfo_outcome.action == "reselect_mpls":
+            console.print("[yellow]→ 返回重新选择正片 MPLS...[/yellow]")
+            auto_skip_mpls = False
+            continue
+        if bdinfo_outcome.action == "skip_disc":
+            console.print("[yellow]→ 已手动跳过该原盘[/yellow]")
+            return DiscPreparationResult(action="skip_disc")
+        bdinfo_data = bdinfo_outcome.data
+
+        processing_decision = resolve_processing_mode(chapter, console)
+
+        try:
+            tracks = workflow_phase3_scan_tracks(bdmv_path, chapter, console, verbose=scan_tracks_verbose)
+        except RuntimeError as exc:
+            return DiscPreparationResult(action="error", error=str(exc))
+        source_tracks = copy.deepcopy(tracks)
+
+        try:
+            video_tracks, audio_tracks, subtitle_tracks, view_data = workflow_phase4_integrate_bdinfo(
+                tracks,
+                bdinfo_data,
+                original_lang,
+                drop_commentary,
+                keep_best_audio,
+                simplify_subs,
+                console,
+            )
+        except RuntimeError as exc:
+            return DiscPreparationResult(action="error", error=str(exc))
+
+        final_tracks = video_tracks + audio_tracks + subtitle_tracks
+
+        if not skip_interactive:
+            console.print("\n[bold cyan]阶段 5：交互式编辑[/bold cyan]")
+            edited_tracks = cli.edit_loop(final_tracks, view_data, source_name=source_name)
+            if edited_tracks is None:
+                console.print("[yellow]已返回上一阶段，将重新选择正片和轨道[/yellow]")
+                auto_skip_mpls = False
+                continue
+            final_tracks = edited_tracks
+        else:
+            console.print("\n[bold cyan]阶段 5：跳过交互式编辑[/bold cyan]")
+            cli.display_tracks(final_tracks, "最终轨道配置", source_name=source_name)
+
+        return DiscPreparationResult(
+            action="ready",
+            session=PreparedDiscSession(
+                chapter=chapter,
+                mpls_path=mpls_path,
+                processing_decision=processing_decision,
+                source_tracks=source_tracks,
+                final_tracks=final_tracks,
+            ),
+        )
+
+
 def workflow_phase6_extract_metadata(bdmv_path: Path, chapter: Chapter, output_dir: Path, console: Console) -> Tuple[str, Dict, Optional[str]]:
     """
     阶段6：提取元数据
@@ -5893,7 +6070,9 @@ def workflow_phase7_remux(
         if processing_decision.get("processing_mode") == "problem_fallback":
             console.print("[cyan]当前处理路径：问题盘外部化兜底[/cyan]")
             if keep_temp:
-                console.print("[yellow]已启用 --keep-temp：保留临时章节文件、MakeMKV 临时 MKV 与 temp 目录；未完成的 .tmp 和空输出目录仍会自动清理。[/yellow]")
+                console.print(
+                    "[yellow]已启用 --keep-temp：保留临时章节文件、MakeMKV 临时 MKV 与 temp 目录；未完成的 .tmp 和空输出目录仍会自动清理。[/yellow]"
+                )
             else:
                 console.print("[dim]收尾清理范围：未完成的 .tmp、临时章节文件、MakeMKV 临时 MKV、temp 目录和空输出目录。[/dim]")
             track_sources, temp_mkv_path, effective_tracks, ignored_hidden_tracks = extract_tracks_with_makemkv(
@@ -6010,68 +6189,34 @@ def main_workflow(
         processing_decision = preconfirmed_config.get("processing_decision", processing_decision)
         source_tracks = preconfirmed_config.get("source_tracks", copy.deepcopy(final_tracks))
     else:
-        # 正常流程：阶段 1-5（可重试循环）
-        auto_skip_phase1 = True
         preferred_playlist = _extract_bdinfo_playlist_name(bdinfo_path)
+        preparation = prepare_disc_session(
+            bdmv_path=bdmv_path,
+            bdinfo_path=bdinfo_path,
+            original_lang=original_lang,
+            drop_commentary=drop_commentary,
+            keep_best_audio=keep_best_audio,
+            simplify_subs=simplify_subs,
+            skip_interactive=skip_interactive,
+            console=console,
+            source_name=source_name,
+            preferred_playlist=preferred_playlist,
+            auto_skip_mpls=True,
+            force_first_candidate=skip_interactive,
+            allow_playlist_back_to_caller=False,
+            scan_tracks_verbose=True,
+        )
+        if preparation.action == "skip_disc":
+            return "skipped"
+        if preparation.action == "error":
+            raise RuntimeError(preparation.error or "单盘准备失败")
 
-        while True:
-            # 阶段 1：扫描 MPLS 并选择正片
-            result = workflow_phase1_scan_mpls(
-                bdmv_path,
-                console,
-                auto_skip=auto_skip_phase1,
-                preferred_playlist=preferred_playlist,
-                force_first_candidate=skip_interactive,
-            )
-            if result == (None, None):  # back
-                console.print("[yellow]已经是第一步，无法返回[/yellow]")
-                auto_skip_phase1 = False
-                continue
-            chapter, mpls_path = result
-
-            # 阶段 2：BDInfo 整合（可选）
-            try:
-                bdinfo_data = workflow_phase2_parse_bdinfo(bdinfo_path, mpls_path.name, console)
-            except ValueError as e:
-                if str(e) == "RESELECT_MPLS":
-                    console.print("[yellow]→ 返回重新选择正片 MPLS...[/yellow]")
-                    auto_skip_phase1 = False
-                    continue
-                elif str(e) == "SKIP_DISC":
-                    console.print("[yellow]→ 已手动跳过该原盘[/yellow]")
-                    return "skipped"
-                else:
-                    raise
-
-            # 阶段 2.5：问题盘预检查（放在 BDInfo PLAYLIST 校验之后，避免无效预检查）
-            processing_decision = resolve_processing_mode(chapter, console)
-
-            # 阶段 3：扫描轨道
-            tracks = workflow_phase3_scan_tracks(bdmv_path, chapter, console)
-            source_tracks = copy.deepcopy(tracks)
-
-            # 阶段 4：轨道排序
-            video_tracks, audio_tracks, subtitle_tracks, view_data = workflow_phase4_integrate_bdinfo(
-                tracks, bdinfo_data, original_lang, drop_commentary, keep_best_audio, simplify_subs, console
-            )
-            final_tracks = video_tracks + audio_tracks + subtitle_tracks
-
-            # 阶段 5：交互式编辑
-            cli = InteractiveCLI()
-            if not skip_interactive:
-                console.print("\n[bold cyan]阶段 5：交互式编辑[/bold cyan]")
-                result = cli.edit_loop(final_tracks, view_data, source_name=source_name)
-                if result is None:  # back
-                    console.print("[yellow]已返回上一阶段，将重新选择正片和轨道[/yellow]")
-                    # 从交互阶段退回时，关闭静默跳过，强制显示表格！
-                    auto_skip_phase1 = False
-                    continue  # 重新从阶段 1 开始
-                final_tracks = result
-            else:
-                console.print("\n[bold cyan]阶段 5：跳过交互式编辑[/bold cyan]")
-                cli.display_tracks(final_tracks, "最终轨道配置", source_name=source_name)
-
-            break  # 正常完成，退出选择循环
+        session = preparation.session
+        chapter = session.chapter
+        mpls_path = session.mpls_path
+        final_tracks = session.final_tracks
+        source_tracks = session.source_tracks
+        processing_decision = session.processing_decision
 
     # 阶段 6：提取元数据
     title, metadata, chapters_file = workflow_phase6_extract_metadata(bdmv_path, chapter, output_dir, console)
@@ -6180,14 +6325,14 @@ def batch_phase1_scan_sources(root_dir: Path, console: Console) -> List[Dict]:
         原盘列表
 
     Raises:
-        SystemExit: 未找到任何原盘或ISO
+        FatalCliError: 未找到任何原盘或ISO
     """
     console.print("\n[bold cyan]阶段 1：扫描原盘[/bold cyan]")
     sources = scan_bluray_sources(root_dir)
 
     if not sources:
         console.print("[red]错误：未找到任何原盘或 ISO 文件[/red]")
-        sys.exit(1)
+        raise FatalCliError("未找到任何原盘或 ISO 文件")
 
     console.print(f"[green]✓ 找到 {len(sources)} 个原盘/ISO[/green]\n")
     return sources
@@ -6207,7 +6352,7 @@ def batch_phase2_match_bdinfo(sources: List[Dict], bdinfo_dir: Optional[Path], c
         任务列表
 
     Raises:
-        SystemExit: 所有原盘都缺少BDInfo
+        FatalCliError: 所有原盘都缺少BDInfo
     """
     console.print("[bold cyan]阶段 2：匹配 BDInfo 和推断原语言[/bold cyan]")
 
@@ -6252,7 +6397,7 @@ def batch_phase2_match_bdinfo(sources: List[Dict], bdinfo_dir: Optional[Path], c
 
     if not tasks:
         console.print("[red]错误：没有可处理的任务（所有原盘均缺少 BDInfo）[/red]")
-        sys.exit(1)
+        raise FatalCliError("没有可处理的任务（所有原盘均缺少 BDInfo）")
 
     console.print(f"[green]✓ 匹配完成，准备处理 {len(tasks)} 个原盘[/green]\n")
     return tasks
@@ -6271,7 +6416,7 @@ def batch_phase3_confirm_tasks(tasks: List[Dict], skip_interactive: bool, consol
         批量模式（"sequential"或"preconfirm"）
 
     Raises:
-        SystemExit: 用户取消批量处理
+        UserAbortError: 用户取消批量处理
     """
     console.print("[bold cyan]阶段 3：任务列表确认[/bold cyan]")
 
@@ -6316,7 +6461,7 @@ def batch_phase3_confirm_tasks(tasks: List[Dict], skip_interactive: bool, consol
                 break
             elif cmd.lower() == "cancel":
                 console.print("[red]已取消批量处理[/red]")
-                sys.exit(0)
+                raise UserAbortError("用户取消批量处理")
             elif cmd.lower().startswith("lang "):
                 try:
                     parts = cmd.split()
@@ -6386,7 +6531,7 @@ def _preconfirm_single_disc(
     global_keep_best_audio: Optional[bool],
     global_simplify_subs: Optional[bool],
     console: Console,
-) -> Literal["next", "prev", "error"]:
+) -> Literal["next", "prev"]:
     """
     预确认单个原盘的轨道配置
 
@@ -6409,130 +6554,71 @@ def _preconfirm_single_disc(
     Returns:
         "next": 成功完成或出错，前进到下一个原盘
         "prev": 用户选择返回上一个原盘
-        "error": 发生不可恢复错误（由调用方决定是否中止）
     """
     source = task["source"]
     console.print(f"\n[bold yellow]=== 配置确认 {disc_index + 1}/{total}: {source['name']} ===[/bold yellow]")
 
-    disc_drop_commentary = global_drop_commentary
-    if disc_drop_commentary is None:
-        ans = Confirm.ask(f"[yellow]是否保留导评音轨和字幕？[/yellow]", default=True)
-        disc_drop_commentary = not ans
-
-    disc_keep_best_audio = global_keep_best_audio
-    if disc_keep_best_audio is None:
-        disc_keep_best_audio = Confirm.ask(f"[yellow]是否为每种语言仅保留一条最高规格音轨？[/yellow]", default=True)
-
-    disc_simplify_subs = global_simplify_subs
-    if disc_simplify_subs is None:
-        disc_simplify_subs = Confirm.ask(f"[yellow]是否精简外语字幕（仅保留一条英语/原语言字幕）？[/yellow]", default=True)
+    policy = resolve_disc_filter_policy(
+        source_name=source["name"],
+        skip_interactive=False,
+        global_drop_commentary=global_drop_commentary,
+        global_keep_best_audio=global_keep_best_audio,
+        global_simplify_subs=global_simplify_subs,
+        console=console,
+    )
 
     # 处理 ISO 或目录源
-    bdmv_path = _process_iso_source(source, mount_manager, console) if source["type"] == "iso" else source["bdmv_path"]
-
+    bdmv_path = _process_iso_source(source, mount_manager, console)
     preferred_playlist = _extract_bdinfo_playlist_name(task["bdinfo_path"])
     auto_skip_mpls = True
-    while True:
-        # 1. 扫描 MPLS 并选择正片
-        console.print("\n[cyan]→ 扫描 MPLS 文件[/cyan]")
-        try:
-            chapter, mpls_path = select_main_playlist(
-                bdmv_path,
-                console,
-                source["name"],
-                auto_skip=auto_skip_mpls,
-                preferred_playlist=preferred_playlist,
-            )
-        except RuntimeError:
-            console.print(f"[red]✗ {source['name']} - 未找到符合条件的正片 MPLS[/red]")
-            task["preconfirm_error"] = "未找到正片 MPLS"
-            return "next"
 
-        # 用户在正片选择界面输入 back
-        if chapter is None or mpls_path is None:
+    while True:
+        preparation = prepare_disc_session(
+            bdmv_path=bdmv_path,
+            bdinfo_path=task["bdinfo_path"],
+            original_lang=task["original_lang"],
+            drop_commentary=policy.drop_commentary,
+            keep_best_audio=policy.keep_best_audio,
+            simplify_subs=policy.simplify_subs,
+            skip_interactive=False,
+            console=console,
+            source_name=source["name"],
+            preferred_playlist=preferred_playlist,
+            auto_skip_mpls=auto_skip_mpls,
+            force_first_candidate=False,
+            allow_playlist_back_to_caller=True,
+            scan_tracks_verbose=False,
+        )
+
+        if preparation.action == "playlist_back":
             if disc_index == 0:
                 console.print("[yellow]已经是第一个原盘，无法返回上一原盘[/yellow]")
-                continue  # 留在当前盘重试
+                auto_skip_mpls = False
+                continue
 
-            # 回退到上一个原盘
             prev_task = tasks[disc_index - 1]
             prev_task.pop("preconfirm_config", None)
             prev_task.pop("preconfirm_error", None)
             console.print(f"[yellow]返回上一个原盘：{prev_task['source']['name']}[/yellow]")
             return "prev"
 
-        # 2. 解析 BDInfo
-        try:
-            bdinfo_data = parse_bdinfo_optional(task["bdinfo_path"], mpls_path.name, console, verify_match=True)
-        except ValueError as e:
-            if str(e) == "RESELECT_MPLS":
-                console.print("[yellow]→ 返回重新选择正片 MPLS...[/yellow]")
-                auto_skip_mpls = False
-                continue
-            elif str(e) == "SKIP_DISC":
-                console.print("[yellow]→ 已手动跳过该原盘[/yellow]")
-                task["preconfirm_error"] = "播放列表不匹配，用户选择跳过"
-                return "next"
-            else:
-                raise
-
-        processing_decision = resolve_processing_mode(chapter, console)
-
-        if bdinfo_data:
-            console.print(f"[green]✓ 已解析 BDInfo[/green]")
-            console.print(f"  PLAYLIST：{bdinfo_data['playlist']}")
-            console.print(f"  音轨：{len(bdinfo_data['audio'])} 个")
-            console.print(f"  字幕：{len(bdinfo_data['subtitle'])} 个")
-
-        # 3. 扫描轨道
-        console.print("[cyan]→ 扫描轨道信息[/cyan]")
-        try:
-            tracks = scan_main_tracks(bdmv_path, chapter, console, verbose=False)
-            console.print(f"[green]✓ 扫描完成[/green]")
-            console.print(f"  视频轨：{sum(1 for t in tracks if t.type == 'video')} 个")
-            console.print(f"  音频轨：{sum(1 for t in tracks if t.type == 'audio')} 个")
-            console.print(f"  字幕轨：{sum(1 for t in tracks if t.type == 'subtitle')} 个\n")
-        except RuntimeError as e:
-            console.print(f"[red]✗ {source['name']} - {e}[/red]")
-            task["preconfirm_error"] = str(e)
+        if preparation.action == "skip_disc":
+            task["preconfirm_error"] = "播放列表不匹配，用户选择跳过"
             return "next"
 
-        # 4. 整合 BDInfo 并准备轨道
-        try:
-            validate_audio_track_indices(tracks, console, allow_cancel=True)
-        except RuntimeError:
-            console.print("[red]已取消处理[/red]")
-            task["preconfirm_error"] = "用户取消处理"
+        if preparation.action == "error":
+            error_message = preparation.error or "单盘准备失败"
+            console.print(f"[red]✗ {source['name']} - 配置确认失败：{error_message}[/red]")
+            task["preconfirm_error"] = error_message
             return "next"
 
-        video_tracks, audio_tracks, subtitle_tracks, view_data = integrate_and_prepare_tracks(
-            tracks, bdinfo_data, task["original_lang"], disc_drop_commentary, disc_keep_best_audio, disc_simplify_subs
-        )
-
-        console.print(f"[green]✓ 排序完成（原始语言：{task['original_lang']}）[/green]")
-
-        # 合并轨道列表
-        final_tracks = video_tracks + audio_tracks + subtitle_tracks
-
-        # 5. 交互式编辑轨道
-        console.print("\n[cyan]→ 轨道配置确认[/cyan]")
-        cli = InteractiveCLI()
-        result = cli.edit_loop(final_tracks, view_data, source_name=source["name"])
-        if result is None:
-            # 用户选择返回：在当前原盘内重新选择正片和轨道
-            console.print("[yellow]已返回上一阶段，将重新选择正片和轨道[/yellow]")
-            auto_skip_mpls = False
-            continue  # 留在当前盘重选
-        final_tracks = result
-
-        # 6. 保存预确认的配置
+        session = preparation.session
         task["preconfirm_config"] = {
-            "mpls_path": mpls_path,
-            "chapter": chapter,
-            "source_tracks": copy.deepcopy(tracks),
-            "final_tracks": final_tracks,
-            "bdinfo_data": bdinfo_data,
-            "processing_decision": processing_decision,
+            "mpls_path": session.mpls_path,
+            "chapter": session.chapter,
+            "source_tracks": copy.deepcopy(session.source_tracks),
+            "final_tracks": session.final_tracks,
+            "processing_decision": session.processing_decision,
         }
 
         console.print(f"[green]✓ {source['name']} - 配置确认完成[/green]")
@@ -6664,7 +6750,7 @@ def _run_single_remux_task(
     task["status"] = "processing"
 
     # 处理 ISO 或目录源
-    bdmv_path = _process_iso_source(source, mount_manager, console) if source["type"] == "iso" else source["bdmv_path"]
+    bdmv_path = _process_iso_source(source, mount_manager, console)
 
     source_output_name = sanitize_filename(source["name"])
     movie_output_dir = output_dir / source_output_name
@@ -6690,26 +6776,14 @@ def _run_single_remux_task(
             source_name=source["name"],
         )
     else:
-        # --- 动态解析单盘过滤策略 ---
-        disc_drop_commentary = global_drop_commentary
-        if disc_drop_commentary is None and not skip_interactive:
-            console.print(f"\n[cyan]→ {source['name']} 轨道过滤策略[/cyan]")
-            ans = Confirm.ask("[yellow]是否保留该原盘的导评音轨和字幕？[/yellow]", default=True)
-            disc_drop_commentary = not ans
-        elif disc_drop_commentary is None:
-            disc_drop_commentary = False
-
-        disc_keep_best_audio = global_keep_best_audio
-        if disc_keep_best_audio is None and not skip_interactive:
-            disc_keep_best_audio = Confirm.ask("[yellow]是否为该原盘每种语言仅保留一条最高规格音轨？[/yellow]", default=True)
-        elif disc_keep_best_audio is None:
-            disc_keep_best_audio = False
-
-        disc_simplify_subs = global_simplify_subs
-        if disc_simplify_subs is None and not skip_interactive:
-            disc_simplify_subs = Confirm.ask("[yellow]是否精简该原盘的外语字幕（仅保留一条最优）？[/yellow]", default=True)
-        elif disc_simplify_subs is None:
-            disc_simplify_subs = True
+        policy = resolve_disc_filter_policy(
+            source_name=source["name"],
+            skip_interactive=skip_interactive,
+            global_drop_commentary=global_drop_commentary,
+            global_keep_best_audio=global_keep_best_audio,
+            global_simplify_subs=global_simplify_subs,
+            console=console,
+        )
 
         # 正常流程（逐个确认模式）
         result = main_workflow(
@@ -6719,9 +6793,9 @@ def _run_single_remux_task(
             bdinfo_path=task["bdinfo_path"],
             original_lang=task["original_lang"],
             skip_interactive=skip_interactive,
-            drop_commentary=disc_drop_commentary,
-            keep_best_audio=disc_keep_best_audio,
-            simplify_subs=disc_simplify_subs,
+            drop_commentary=policy.drop_commentary,
+            keep_best_audio=policy.keep_best_audio,
+            simplify_subs=policy.simplify_subs,
             keep_temp=keep_temp,
             source_name=source["name"],
         )
@@ -6928,36 +7002,35 @@ def main():
     if DEBUG:
         console.print("[yellow][debug] 调试输出已开启[/yellow]")
 
-    # 检查工具链
-    check_tools()
-    print()
-
-    # 清理路径参数
-    root_dir = clean_path(args.input)
-    output_dir = clean_path(args.output)
-    temp_dir = clean_path(args.temp) if args.temp else None
-    bdinfo_dir = clean_path(args.bdinfo_dir) if args.bdinfo_dir else None
-
-    # 验证路径
-    if not root_dir.exists():
-        console.print(f"[red]错误：根目录不存在：{root_dir}[/red]")
-        sys.exit(1)
-
-    if bdinfo_dir and not bdinfo_dir.exists():
-        console.print(f"[red]错误：BDInfo 目录不存在：{bdinfo_dir}[/red]")
-        sys.exit(1)
-
-    if temp_dir and temp_dir.exists() and not temp_dir.is_dir():
-        console.print(f"[red]错误：临时目录不是目录：{temp_dir}[/red]")
-        sys.exit(1)
-
-    if args.keep_temp and args.delete_source:
-        console.print(
-            "[yellow]提示：已启用 --keep-temp，脚本将忽略 --delete-source，并保留源文件、BDInfo、临时章节文件及问题盘临时文件；未完成的 .tmp 与空输出目录仍会自动清理。[/yellow]"
-        )
-
-    # 执行批量处理流程
     try:
+        # 检查工具链
+        check_tools()
+        print()
+
+        # 清理路径参数
+        root_dir = clean_path(args.input)
+        output_dir = clean_path(args.output)
+        temp_dir = clean_path(args.temp) if args.temp else None
+        bdinfo_dir = clean_path(args.bdinfo_dir) if args.bdinfo_dir else None
+
+        # 验证路径
+        if not root_dir.exists():
+            console.print(f"[red]错误：根目录不存在：{root_dir}[/red]")
+            sys.exit(1)
+
+        if bdinfo_dir and not bdinfo_dir.exists():
+            console.print(f"[red]错误：BDInfo 目录不存在：{bdinfo_dir}[/red]")
+            sys.exit(1)
+
+        if temp_dir and temp_dir.exists() and not temp_dir.is_dir():
+            console.print(f"[red]错误：临时目录不是目录：{temp_dir}[/red]")
+            sys.exit(1)
+
+        if args.keep_temp and args.delete_source:
+            console.print(
+                "[yellow]提示：已启用 --keep-temp，脚本将忽略 --delete-source，并保留源文件、BDInfo、临时章节文件及问题盘临时文件；未完成的 .tmp 与空输出目录仍会自动清理。[/yellow]"
+            )
+
         # 阶段 1：扫描原盘
         sources = batch_phase1_scan_sources(root_dir, console)
 
@@ -7049,6 +7122,10 @@ def main():
 
         sys.exit(0 if failed_count == 0 else 1)
 
+    except UserAbortError:
+        sys.exit(0)
+    except FatalCliError:
+        sys.exit(1)
     except KeyboardInterrupt:
         console.print("\n[yellow]用户中断操作[/yellow]")
         sys.exit(1)
