@@ -37,7 +37,7 @@ import pycountry
 import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Set, Tuple
 from struct import unpack
 from rich.console import Console
 from rich.table import Table
@@ -4186,12 +4186,12 @@ def extract_tracks_with_makemkv(
 
     temp_output_dir = temp_dir
     temp_output_dir.mkdir(parents=True, exist_ok=True)
-    temp_cleanup_paths: Set[Path] = {temp_output_dir}
+    temp_cleanup_registry = CleanupRegistry(temp_output_dir)
 
     try:
         if not reuse_existing:
             stale_files = {path for path in temp_output_dir.glob("*.mkv") if path.is_file()}
-            cleanup_generated_paths(stale_files)
+            cleanup_generated_paths(stale_files, console)
 
         temp_mkv_path: Optional[Path] = None
         if reuse_existing:
@@ -4215,8 +4215,8 @@ def extract_tracks_with_makemkv(
         return track_sources, temp_mkv_path, effective_selected_tracks, ignored_hidden_tracks
     except BaseException:
         if not reuse_existing:
-            temp_cleanup_paths.update(path for path in temp_output_dir.rglob("*"))
-            cleanup_generated_paths(temp_cleanup_paths, console)
+            temp_cleanup_registry.add_paths(temp_output_dir.rglob("*"))
+            temp_cleanup_registry.cleanup(console)
         raise
 
 
@@ -4250,38 +4250,72 @@ def build_mkvmerge_command_for_temp_mkv(
     return cmd
 
 
-def collect_generated_paths(track_sources: Optional[Dict[int, Dict[str, Any]]] = None, chapters_file: Optional[str] = None) -> Set[Path]:
-    """收集外部处理过程中生成的中间文件。"""
-    generated_paths: Set[Path] = set()
+class CleanupRegistry:
+    """统一登记并执行中间产物清理。"""
 
-    for source_info in (track_sources or {}).values():
-        cleanup_paths = source_info.get("cleanup_paths") or [source_info.get("path")]
-        for path_str in cleanup_paths:
-            if path_str:
-                generated_paths.add(Path(path_str))
+    def __init__(self, *paths: Optional[Any]):
+        self._paths: Set[Path] = set()
+        self.add_paths(paths)
 
-    if chapters_file:
-        generated_paths.add(Path(chapters_file))
+    def add_path(self, path: Optional[Any]) -> None:
+        if path:
+            self._paths.add(Path(path))
 
-    return generated_paths
+    def add_paths(self, paths: Iterable[Optional[Any]]) -> None:
+        for path in paths:
+            self.add_path(path)
+
+    def add_track_sources(self, track_sources: Optional[Dict[int, Dict[str, Any]]]) -> None:
+        for source_info in (track_sources or {}).values():
+            cleanup_paths = source_info.get("cleanup_paths") or [source_info.get("path")]
+            self.add_paths(cleanup_paths)
+
+    def has_paths(self) -> bool:
+        return bool(self._paths)
+
+    def cleanup(self, console: Optional[Console] = None, retries: int = 3, retry_delay: float = 0.2) -> List[Path]:
+        return cleanup_generated_paths(self._paths, console=console, retries=retries, retry_delay=retry_delay)
 
 
-def cleanup_generated_paths(paths: Set[Path], console: Optional[Console] = None) -> None:
+def cleanup_generated_paths(
+    paths: Set[Path],
+    console: Optional[Console] = None,
+    retries: int = 3,
+    retry_delay: float = 0.2,
+) -> List[Path]:
     """清理外部处理过程中产生的中间文件。"""
     cleaned_count = 0
-    for path in sorted(paths, key=lambda item: len(str(item)), reverse=True):
-        try:
-            if path.exists() and path.is_file():
-                path.unlink()
-                cleaned_count += 1
-            elif path.exists() and path.is_dir() and not any(path.iterdir()):
-                path.rmdir()
-                cleaned_count += 1
-        except OSError:
-            continue
+    failed_paths: List[Path] = []
+    retries = max(1, retries)
+    for path in sorted({Path(path) for path in paths if path}, key=lambda item: len(str(item)), reverse=True):
+        last_error: Optional[OSError] = None
+        for attempt in range(retries):
+            try:
+                if path.exists() and path.is_file():
+                    path.unlink()
+                    cleaned_count += 1
+                elif path.exists() and path.is_dir() and not any(path.iterdir()):
+                    path.rmdir()
+                    cleaned_count += 1
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+                if attempt < retries - 1:
+                    time.sleep(retry_delay)
+        if last_error and path.exists():
+            failed_paths.append(path)
 
     if cleaned_count and console:
-        console.print(f"[dim]已清理 {cleaned_count} 个中间文件[/dim]")
+        console.print(f"[dim]已删除 {cleaned_count} 个中间产物[/dim]")
+    if failed_paths and console:
+        failed_names = ", ".join(path.name for path in failed_paths[:5])
+        more_count = len(failed_paths) - 5
+        suffix = f" 等另外 {more_count} 项" if more_count > 0 else ""
+        console.print(
+            f"[yellow]⚠ 以下中间产物暂未清理成功，可能仍被其他进程占用，可稍后重试或手动删除：{failed_names}{suffix}[/yellow]"
+        )
+    return failed_paths
 
 
 def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
@@ -4368,19 +4402,6 @@ def run_mkvmerge_with_progress(cmd: List[str], max_retries: int = 2, stop_on_pro
     except (ValueError, IndexError):
         pass
 
-    # 内部清理辅助函数：删文件 + 删空文件夹
-    def _cleanup_tmp():
-        if tmp_output and tmp_output.exists():
-            try:
-                tmp_output.unlink()
-                console.print(f"  [dim]已清理未完成的临时文件: {tmp_output.name}[/dim]")
-                parent_dir = tmp_output.parent
-                if parent_dir.exists() and not any(parent_dir.iterdir()):
-                    parent_dir.rmdir()
-                    console.print(f"  [dim]已清理空文件夹: {parent_dir.name}[/dim]")
-            except Exception:
-                pass
-
     for attempt in range(max_retries):
         try:
             returncode, output_text = _run_subprocess_with_live_output(cmd)
@@ -4389,7 +4410,7 @@ def run_mkvmerge_with_progress(cmd: List[str], max_retries: int = 2, stop_on_pro
             # mkvmerge 状态码: 0=完美, 1=有警告但成功, 2=严重错误
             if returncode in (0, 1):
                 if returncode == 1:
-                    console.print("  [yellow]提示：mkvmerge 报告了非致命警告，但文件已成功生成。[/yellow]")
+                    console.print("  [yellow]提示：mkvmerge 报告了非致命警告，但已成功生成正式输出文件。[/yellow]")
 
                 # 执行成功，重命名回原格式
                 if tmp_output and tmp_output.exists():
@@ -4397,26 +4418,22 @@ def run_mkvmerge_with_progress(cmd: List[str], max_retries: int = 2, stop_on_pro
                 return {"success": True, "output": output_text, "returncode": returncode, "problem_reason": None}
             else:
                 if problem_reason:
-                    _cleanup_tmp()
                     return {"success": False, "output": output_text, "returncode": returncode, "problem_reason": problem_reason}
 
                 # 返回码 >= 2 才是真正的失败
                 if attempt < max_retries - 1:
-                    console.print("[yellow]⚠ 遇到错误或文件被占用，等待 2 秒后重试...[/yellow]")
+                    console.print("[yellow]⚠ mkvmerge 执行失败或输出文件仍被占用，2 秒后重试；未完成的 .tmp 将在统一收尾阶段处理。[/yellow]")
                     time.sleep(2)
                     continue
 
-                _cleanup_tmp()
                 return {"success": False, "output": output_text, "returncode": returncode, "problem_reason": None}
 
         except KeyboardInterrupt:
-            console.print(f"\n[yellow]检测到手动中断，正在清理...[/yellow]")
-            _cleanup_tmp()
+            console.print(f"\n[yellow]检测到手动中断，已退出 mkvmerge，进入统一收尾清理...[/yellow]")
             raise
 
         except Exception as e:
-            console.print(f"\n[red]✗ 执行 mkvmerge 时出错：{e}[/red]")
-            _cleanup_tmp()
+            console.print(f"\n[red]✗ 执行 mkvmerge 时出错：{e}；将进入统一收尾清理中间产物。[/red]")
             return {"success": False, "output": str(e), "returncode": -1, "problem_reason": None}
 
     return {"success": False, "output": "", "returncode": -1, "problem_reason": None}
@@ -4834,7 +4851,7 @@ class ISOmountManager:
 
         self._check_interrupt_msg()
 
-        iso_path, mount_point = self.mounted_isos.pop()
+        iso_path, mount_point = self.mounted_isos[-1]
         try:
             unmount_handler = self._get_handler("unmount")
             if self._get_platform_key() == "win32":
@@ -4844,7 +4861,9 @@ class ISOmountManager:
 
             self.console.print(f"[green]✓ 已卸载: {iso_path.name}[/green]")
         except Exception as e:
-            self.console.print(f"[yellow]⚠ 卸载失败: {iso_path.name} - {e}[/yellow]")
+            self.console.print(f"[yellow]⚠ 卸载失败: {iso_path.name} - {e}；已保留挂载追踪，阶段结束时会再次尝试。[/yellow]")
+        else:
+            self.mounted_isos.pop()
 
     def _mount_windows(self, iso_path: Path) -> Path:
         """Windows 挂载（通过 PowerShell Mount-DiskImage）"""
@@ -4952,6 +4971,7 @@ class ISOmountManager:
 
         self._check_interrupt_msg()
 
+        remaining_mounts = []
         for iso_path, mount_point in self.mounted_isos:
             try:
                 unmount_handler = self._get_handler("unmount")
@@ -4963,9 +4983,10 @@ class ISOmountManager:
                 self.console.print(f"[green]✓ 已卸载: {iso_path.name}[/green]")
 
             except Exception as e:
-                self.console.print(f"[yellow]⚠ 卸载失败: {iso_path.name} - {e}[/yellow]")
+                self.console.print(f"[yellow]⚠ 卸载失败: {iso_path.name} - {e}；已保留挂载追踪，请稍后重试或手动检查。[/yellow]")
+                remaining_mounts.append((iso_path, mount_point))
 
-        self.mounted_isos.clear()
+        self.mounted_isos = remaining_mounts
 
     def _unmount_windows(self, iso_path: Path):
         """Windows 卸载（通过 Dismount-DiskImage）"""
@@ -5854,21 +5875,27 @@ def workflow_phase7_remux(
     keep_temp: bool,
     console: Console,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """阶段 7：执行 Remux，并在结束后统一清理 fallback 产物。"""
+    """阶段 7：执行 Remux，并在结束后统一清理中间产物。"""
     console.print("\n[bold cyan]阶段 7：执行 Remux[/bold cyan]")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"{title}.mkv"
     effective_temp_dir = temp_dir or (output_dir / "temp")
+    tmp_output_file = output_file.with_suffix(output_file.suffix + ".tmp")
 
     console.print(f"输出文件：{output_file}")
     track_sources: Dict[int, Dict[str, Any]] = {}
     effective_chapters_file = chapters_file
-    generated_paths: Set[Path] = collect_generated_paths(chapters_file=effective_chapters_file)
+    always_cleanup = CleanupRegistry(tmp_output_file, output_dir)
+    generated_cleanup = CleanupRegistry(effective_chapters_file)
 
     try:
         if processing_decision.get("processing_mode") == "problem_fallback":
             console.print("[cyan]当前处理路径：问题盘外部化兜底[/cyan]")
+            if keep_temp:
+                console.print("[yellow]已启用 --keep-temp：保留临时章节文件、MakeMKV 临时 MKV 与 temp 目录；未完成的 .tmp 和空输出目录仍会自动清理。[/yellow]")
+            else:
+                console.print("[dim]收尾清理范围：未完成的 .tmp、临时章节文件、MakeMKV 临时 MKV、temp 目录和空输出目录。[/dim]")
             track_sources, temp_mkv_path, effective_tracks, ignored_hidden_tracks = extract_tracks_with_makemkv(
                 mpls_path,
                 title,
@@ -5881,9 +5908,8 @@ def workflow_phase7_remux(
             if ignored_hidden_tracks:
                 # 保持后续摘要与实际封装一致
                 tracks[:] = effective_tracks
-            generated_paths = collect_generated_paths(track_sources, effective_chapters_file)
-            generated_paths.add(temp_mkv_path.parent)
-            generated_paths.add(temp_mkv_path.parent.parent)
+            generated_cleanup = CleanupRegistry(effective_chapters_file, temp_mkv_path.parent, temp_mkv_path.parent.parent)
+            generated_cleanup.add_track_sources(track_sources)
             cmd = build_mkvmerge_command_for_temp_mkv(
                 output_path=str(output_file),
                 temp_mkv_path=temp_mkv_path,
@@ -5894,6 +5920,10 @@ def workflow_phase7_remux(
                 chapters_file=effective_chapters_file,
             )
         else:
+            if keep_temp:
+                console.print("[yellow]已启用 --keep-temp：保留临时章节文件等中间文件；未完成的 .tmp 和空输出目录仍会自动清理。[/yellow]")
+            else:
+                console.print("[dim]收尾清理范围：未完成的 .tmp、临时章节文件和空输出目录。[/dim]")
             cmd = build_mkvmerge_command(
                 output_path=str(output_file),
                 mpls_path=str(mpls_path),
@@ -5924,7 +5954,8 @@ def workflow_phase7_remux(
         return result["success"], processing_decision
     finally:
         if not keep_temp:
-            cleanup_generated_paths(generated_paths, console if generated_paths else None)
+            generated_cleanup.cleanup(console if generated_cleanup.has_paths() else None)
+        always_cleanup.cleanup(console if always_cleanup.has_paths() else None)
 
 
 def main_workflow(
@@ -5954,7 +5985,7 @@ def main_workflow(
         drop_commentary: 是否全局剔除导评轨
         keep_best_audio: 是否每种语言仅保留最优音轨
         simplify_subs: 是否精简外语字幕（英语/原语言仅保留排序最优的一条）
-        keep_temp: 是否保留并复用问题盘外部化路径的中间文件；启用后会忽略 delete_source
+        keep_temp: 是否保留临时章节文件及问题盘外部化路径的中间文件；启用后会忽略 delete_source，但未完成的 .tmp 与空输出目录仍会清理
         source_name: 原盘名称（可选，传入以便在交互界面的表格中提示用户）
     """
     console = Console()
@@ -6123,7 +6154,11 @@ def parse_arguments():
         "--simplify-subs", type=str, choices=["no", "yes", "ask"], default=None, help="精简外语字幕 (yes仅留最优/no保留所有/ask单盘询问)"
     )
     parser.add_argument("--delete-source", action="store_true", help="处理成功后自动删除原盘文件 (ISO 或文件夹) (谨慎使用)")
-    parser.add_argument("--keep-temp", action="store_true", help="保留并复用问题盘 MakeMKV 临时 MKV，并强制保留源文件与 BDInfo（测试用，请勿开启）")
+    parser.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="保留临时章节文件及问题盘 MakeMKV 临时 MKV，并强制保留源文件与 BDInfo；未完成的 .tmp 与空输出目录仍会自动清理（测试用，请勿开启）",
+    )
     parser.add_argument("--debug", action="store_true", help="输出轨道补全、MakeMKV 回绑与封装调试信息（测试用，请勿开启）")
     return parser.parse_args()
 
@@ -6182,11 +6217,13 @@ def batch_phase2_match_bdinfo(sources: List[Dict], bdinfo_dir: Optional[Path], c
     for source in sources:
         bdinfo_path = find_bdinfo_for_source(source, bdinfo_dir)
         cleanup_bdinfo_path = None
+        transient_bdinfo_path = None
 
         if bdinfo_path is None:
             if stdin_is_tty:
                 bdinfo_path = prompt_for_missing_bdinfo_text(source["name"], console)
                 cleanup_bdinfo_path = bdinfo_path
+                transient_bdinfo_path = bdinfo_path
 
             if bdinfo_path is None:
                 console.print(f"[yellow]警告：未找到 BDInfo - {source['name']}[/yellow]")
@@ -6207,6 +6244,7 @@ def batch_phase2_match_bdinfo(sources: List[Dict], bdinfo_dir: Optional[Path], c
                 "source": source,
                 "bdinfo_path": bdinfo_path,
                 "cleanup_bdinfo_path": cleanup_bdinfo_path,
+                "transient_bdinfo_path": transient_bdinfo_path,
                 "original_lang": original_lang,
                 "status": "pending",
             }
@@ -6728,7 +6766,7 @@ def batch_phase4_remux(
         global_keep_best_audio: 全局音轨精简策略
         global_simplify_subs: 全局外语字幕精简策略
         delete_source: 处理成功后是否自动删除原盘文件及当前任务绑定的 BDInfo 缓存（危险操作）
-        keep_temp: 是否保留临时文件；启用后会忽略 delete_source
+        keep_temp: 是否保留临时章节文件与问题盘中间文件；启用后会忽略 delete_source，但未完成的 .tmp 与空输出目录仍会清理
         console: Rich Console对象
 
     Returns:
@@ -6739,7 +6777,7 @@ def batch_phase4_remux(
         如果任务有 preconfirm_config，使用预确认配置
         否则执行正常的交互式流程。
         如果在参数中启用了 delete_source，会在单个任务返回 success 时立即执行原盘清理，并删除当前任务绑定的本地 BDInfo 或临时 BDInfo 缓存。
-        如果 keep_temp 为 True，则会强制保留源文件、BDInfo 与临时产物，忽略 delete_source。
+        如果 keep_temp 为 True，则会强制保留源文件、BDInfo、临时章节文件与问题盘临时产物，忽略 delete_source；未完成的 .tmp 与空输出目录仍会按收尾逻辑清理。
     """
     console.print("\n[bold cyan]阶段 4：批量 Remux[/bold cyan]")
 
@@ -6791,8 +6829,14 @@ def batch_phase4_remux(
                             console.print(f"[red]✗ 删除原盘失败：{e}[/red]")
 
                         # 仅删除当前任务预先绑定的可清理 BDInfo
+                        transient_bdinfo_path = task.get("transient_bdinfo_path")
                         cleanup_bdinfo_path = task.get("cleanup_bdinfo_path")
-                        if cleanup_bdinfo_path and cleanup_bdinfo_path.exists() and cleanup_bdinfo_path.is_file():
+                        if (
+                            cleanup_bdinfo_path
+                            and cleanup_bdinfo_path != transient_bdinfo_path
+                            and cleanup_bdinfo_path.exists()
+                            and cleanup_bdinfo_path.is_file()
+                        ):
                             try:
                                 console.print(f"[yellow]→ 正在删除对应的 BDInfo 文件：{cleanup_bdinfo_path}[/yellow]")
                                 cleanup_bdinfo_path.unlink()
@@ -6817,6 +6861,11 @@ def batch_phase4_remux(
                     break
 
             finally:
+                if not keep_temp:
+                    transient_bdinfo_path = task.get("transient_bdinfo_path")
+                    if transient_bdinfo_path:
+                        console.print(f"[dim]收尾清理：尝试删除本次粘贴的临时 BDInfo 缓存：{Path(transient_bdinfo_path).name}[/dim]")
+                        CleanupRegistry(transient_bdinfo_path, Path(transient_bdinfo_path).parent).cleanup(console)
                 # 卸载当前 ISO（如果已挂载）
                 if source["type"] == "iso" and mount_manager:
                     mount_manager.unmount_last()
@@ -6903,7 +6952,9 @@ def main():
         sys.exit(1)
 
     if args.keep_temp and args.delete_source:
-        console.print("[yellow]提示：已启用 --keep-temp，脚本将忽略 --delete-source 并强制保留源文件、BDInfo 与临时文件。[/yellow]")
+        console.print(
+            "[yellow]提示：已启用 --keep-temp，脚本将忽略 --delete-source，并保留源文件、BDInfo、临时章节文件及问题盘临时文件；未完成的 .tmp 与空输出目录仍会自动清理。[/yellow]"
+        )
 
     # 执行批量处理流程
     try:
