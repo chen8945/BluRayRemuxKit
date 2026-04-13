@@ -66,10 +66,10 @@ NO_WINDOW_CREATION_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32
 # fmt: off
 # 工具路径配置（优先级：自定义路径 > 脚本目录 > 系统 PATH）
 CUSTOM_PATHS = {
-    "mkvmerge": "",
-    "ffprobe": "",
-    "makemkvcon": "",
-    "MakeMKVProfile": "",
+    "mkvmerge": r"",
+    "ffprobe": r"",
+    "makemkvcon": r"",
+    "MakeMKVProfile": r"",
 }
 
 # 音轨编码权重（用于轨道排序）
@@ -533,8 +533,18 @@ def resolve_disc_filter_policy(
     console: Console,
 ) -> DiscFilterPolicy:
     """统一解析单盘过滤策略，减少批量预确认与正式处理的重复逻辑。"""
-    if source_name and not skip_interactive:
-        console.print(f"\n[cyan]→ {source_name} 轨道过滤策略[/cyan]")
+
+    # 判断是否真的需要弹出交互询问
+    needs_prompt = not skip_interactive and (global_drop_commentary is None or global_keep_best_audio is None or global_simplify_subs is None)
+
+    if source_name:
+        if needs_prompt:
+            console.print(f"\n[cyan]→ {source_name} 轨道过滤策略[/cyan]")
+        elif not skip_interactive:
+            debug_print(f"\n[cyan]→ {source_name} 轨道过滤策略 (已应用全局配置)[/cyan]")
+            debug_print(f"  [dim]- 导评轨道：{'剔除' if global_drop_commentary else '保留'}[/dim]")
+            debug_print(f"  [dim]- 最高音轨：{'仅留最优' if global_keep_best_audio else '全部保留'}[/dim]")
+            debug_print(f"  [dim]- 外语字幕：{'精简 (仅留最优)' if global_simplify_subs else '全部保留'}[/dim]")
 
     drop_commentary = global_drop_commentary
     if drop_commentary is None and not skip_interactive:
@@ -3872,13 +3882,23 @@ def _resolve_disc_root_from_mpls(mpls_path: Path) -> Path:
     return bdmv_dir.parent
 
 
-def run_makemkv_info_with_robot(disc_root: Path, console: Optional[Console] = None) -> str:
-    """执行 `makemkvcon -r info` 并返回输出文本（静默模式，仅打印开始/完成）。"""
+def run_makemkv_info_with_robot(makemkv_target: str, console: Optional[Console] = None) -> str:
+    """
+    执行 `makemkvcon -r info` 并返回输出文本（静默模式，仅打印开始/完成）。
+
+    Args:
+        makemkv_target: 目标路径，例如 "iso:D:/xxx.iso" 或 "file:D:/BDMV_ROOT"
+        console: Rich Console 对象
+    """
     require_tools(["makemkvcon"])
     console = console or Console()
     makemkv = require_executable("makemkvcon")
-    cmd = [makemkv, "-r", "info", f"file:{disc_root}"]
+    cmd = [makemkv, "--noscan", "-r", "info", makemkv_target]
     console.print("[cyan]MakeMKV 正在读取原盘信息（-r info）...[/cyan]")
+
+    console.print("\nMakeMKV 命令：")
+    console.print(" ".join(f'"{str(c)}"' if " " in str(c) else str(c) for c in cmd))
+    console.print()
 
     process = subprocess.Popen(
         cmd,
@@ -3975,19 +3995,38 @@ def _resolve_makemkv_title_output(output_dir: Path, title_id: int) -> Path:
 
 
 def run_makemkv_title_extract(
-    disc_root: Path,
+    makemkv_target: str,
     title_id: int,
     output_dir: Path,
     console: Console,
     profile_path: Optional[Path] = None,
 ) -> Path:
-    """执行 MakeMKV 单标题导出并返回输出 MKV 路径。"""
+    """
+    执行 MakeMKV 单标题导出并返回输出 MKV 路径。
+
+    Args:
+        makemkv_target: 目标路径，例如 "iso:D:/xxx.iso" 或 "file:D:/BDMV_ROOT"
+        title_id: MakeMKV 解析出的 Title ID
+        output_dir: 临时 MKV 输出目录
+        console: Rich Console 对象
+        profile_path: MakeMKV 配置文件路径
+    """
     require_tools(["makemkvcon"])
     makemkv = require_executable("makemkvcon")
     cmd = [makemkv]
+    cmd.append("--noscan")
+
+    if not DEBUG:
+        cmd.append("--messages=-null")
+    cmd.append("--progress=-stdout")
+
     if profile_path:
         cmd.append(f"--profile={profile_path}")
-    cmd.extend(["mkv", f"file:{disc_root}", str(title_id), str(output_dir)])
+    cmd.extend(["mkv", makemkv_target, str(title_id), str(output_dir)])
+
+    console.print("\nMakeMKV 命令：")
+    console.print(" ".join(f'"{str(c)}"' if " " in str(c) else str(c) for c in cmd))
+    console.print()
 
     returncode, output_text = _run_command_with_status(
         cmd,
@@ -4239,10 +4278,23 @@ def extract_tracks_with_makemkv(
     source_tracks: List[Track],
     selected_tracks: Optional[List[Track]],
     temp_dir: Path,
+    iso_path: Optional[Path] = None,
     reuse_existing: bool = False,
     console: Optional[Console] = None,
 ) -> Tuple[Dict[int, Dict[str, Any]], Path, List[Track], List[Track]]:
-    """问题盘路径：使用 MakeMKV 导出临时 MKV，并回绑最终保留轨道。"""
+    """
+    问题盘路径：使用 MakeMKV 导出临时 MKV，并回绑最终保留轨道。
+
+    Args:
+        mpls_path: 当前处理的正片 MPLS 路径
+        title: 目标输出文件名（不含扩展名）
+        source_tracks: 原盘的所有原始轨道
+        selected_tracks: 用户过滤/编辑后选择保留的轨道
+        temp_dir: 临时 MKV 的存放目录
+        iso_path: 原始 ISO 文件路径（使用原生 iso: 协议加速读取）
+        reuse_existing: 是否复用已存在的临时 MKV（用于重试逻辑）
+        console: Rich Console 对象
+    """
     console = console or Console()
     selected_tracks = selected_tracks or source_tracks
     require_tools(["makemkvcon", "mkvmerge"])
@@ -4262,8 +4314,14 @@ def extract_tracks_with_makemkv(
             "MakeMKV profile 配置文件不可用：请设置 MAKEMKV_PROFILE 为配置文件路径，或指向包含 default.mmcp.xml / 唯一 .mmcp.xml 的目录"
         )
 
-    disc_root = _resolve_disc_root_from_mpls(mpls_path)
-    info_output = run_makemkv_info_with_robot(disc_root, console=console)
+    if iso_path:
+        makemkv_target = f"iso:{iso_path.absolute()}"
+        debug_print(f"[dim]MakeMKV 源已切换为原生 ISO 直读: {makemkv_target}[/dim]", console)
+    else:
+        disc_root = _resolve_disc_root_from_mpls(mpls_path)
+        makemkv_target = f"file:{disc_root}"
+
+    info_output = run_makemkv_info_with_robot(makemkv_target, console=console)
     tinfo = parse_makemkv_tinfo(info_output)
     title_id = select_makemkv_title_by_playlist(tinfo, mpls_path)
 
@@ -4286,7 +4344,7 @@ def extract_tracks_with_makemkv(
 
         if temp_mkv_path is None:
             temp_mkv_path = run_makemkv_title_extract(
-                disc_root=disc_root,
+                makemkv_target=makemkv_target,
                 title_id=title_id,
                 output_dir=temp_output_dir,
                 console=console,
@@ -4315,7 +4373,6 @@ def build_mkvmerge_command_for_temp_mkv(
     """构建基于单个临时 MKV 输入的 mkvmerge 命令。"""
     cmd = [require_executable("mkvmerge"), "-o", output_path]
     _append_mkvmerge_title_and_chapters(cmd, title, chapters_file)
-
     _append_mkvmerge_track_selection_with_resolver(cmd, tracks, lambda track: int(track_sources[track.id]["track_id"]))
 
     track_order_parts = []
@@ -4401,6 +4458,7 @@ def cleanup_generated_paths(
 
 def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
     """执行外部命令并同步转发输出，同时收集完整文本。"""
+    is_mkvmerge = any("mkvmerge" in str(c).lower() for c in cmd)
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -4417,8 +4475,12 @@ def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
         re.compile(r"^progress:\s*\d+%$", re.IGNORECASE),
         re.compile(r"^进度:\s*\d+%$"),
         re.compile(r"^\d+\s*%\s*$"),
+        re.compile(r"^#GUI#progress\s+(\d+)%", re.IGNORECASE),
+        re.compile(r"^Current progress - \d+%.*Total progress - \d+%", re.IGNORECASE),
     ]
     last_line_was_progress = False
+
+    mkvmerge_verbose_blacklist = ["格式输出模块", "格式分离器", "output module", "demultiplexer"]
 
     def _is_progress_line(text: str) -> bool:
         stripped = text.strip()
@@ -4427,17 +4489,23 @@ def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
     try:
         if process.stdout:
             for line in process.stdout:
+                output_chunks.append(line)
+
                 if _is_progress_line(line):
                     sys.stdout.write("\r" + line.strip())
                     sys.stdout.flush()
                     last_line_was_progress = True
                 else:
+                    if is_mkvmerge and not DEBUG:
+                        if any(kw in line for kw in mkvmerge_verbose_blacklist):
+                            continue
+
                     if last_line_was_progress:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
                         last_line_was_progress = False
+
                     print(line, end="")
-                output_chunks.append(line)
 
         if last_line_was_progress:
             sys.stdout.write("\n")
@@ -6050,6 +6118,7 @@ def workflow_phase7_remux(
     source_tracks: List[Track],
     processing_decision: Dict[str, Any],
     keep_temp: bool,
+    iso_path: Optional[Path],
     console: Console,
 ) -> Tuple[bool, Dict[str, Any]]:
     """阶段 7：执行 Remux，并在结束后统一清理中间产物。"""
@@ -6070,17 +6139,18 @@ def workflow_phase7_remux(
         if processing_decision.get("processing_mode") == "problem_fallback":
             console.print("[cyan]当前处理路径：问题盘外部化兜底[/cyan]")
             if keep_temp:
-                console.print(
+                debug_print(
                     "[yellow]已启用 --keep-temp：保留临时章节文件、MakeMKV 临时 MKV 与 temp 目录；未完成的 .tmp 和空输出目录仍会自动清理。[/yellow]"
                 )
             else:
-                console.print("[dim]收尾清理范围：未完成的 .tmp、临时章节文件、MakeMKV 临时 MKV、temp 目录和空输出目录。[/dim]")
+                debug_print("[dim]收尾清理范围：未完成的 .tmp、临时章节文件、MakeMKV 临时 MKV、temp 目录和空输出目录。[/dim]")
             track_sources, temp_mkv_path, effective_tracks, ignored_hidden_tracks = extract_tracks_with_makemkv(
                 mpls_path,
                 title,
                 source_tracks,
                 tracks,
                 effective_temp_dir,
+                iso_path=iso_path,
                 reuse_existing=keep_temp,
                 console=console,
             )
@@ -6100,9 +6170,9 @@ def workflow_phase7_remux(
             )
         else:
             if keep_temp:
-                console.print("[yellow]已启用 --keep-temp：保留临时章节文件等中间文件；未完成的 .tmp 和空输出目录仍会自动清理。[/yellow]")
+                debug_print("[yellow]已启用 --keep-temp：保留临时章节文件等中间文件；未完成的 .tmp 和空输出目录仍会自动清理。[/yellow]")
             else:
-                console.print("[dim]收尾清理范围：未完成的 .tmp、临时章节文件和空输出目录。[/dim]")
+                debug_print("[dim]收尾清理范围：未完成的 .tmp、临时章节文件和空输出目录。[/dim]")
             cmd = build_mkvmerge_command(
                 output_path=str(output_file),
                 mpls_path=str(mpls_path),
@@ -6150,6 +6220,7 @@ def main_workflow(
     simplify_subs: bool = True,
     keep_temp: bool = False,
     source_name: Optional[str] = None,
+    iso_path: Optional[Path] = None,
 ):
     """主流程封装
 
@@ -6234,6 +6305,7 @@ def main_workflow(
         source_tracks,
         processing_decision,
         keep_temp,
+        iso_path,
         console,
     )
 
@@ -6250,7 +6322,8 @@ def main_workflow(
             source_tracks,
             processing_decision,
             keep_temp,
-            console,
+            iso_path=iso_path,
+            console=console,
         )
 
     # 阶段 8：输出摘要
@@ -6751,7 +6824,7 @@ def _run_single_remux_task(
 
     # 处理 ISO 或目录源
     bdmv_path = _process_iso_source(source, mount_manager, console)
-
+    iso_path = source["path"] if source["type"] == "iso" else None
     source_output_name = sanitize_filename(source["name"])
     movie_output_dir = output_dir / source_output_name
     movie_temp_dir = (temp_dir / source_output_name) if temp_dir else (movie_output_dir / "temp")
@@ -6774,6 +6847,7 @@ def _run_single_remux_task(
             simplify_subs=False,
             keep_temp=keep_temp,
             source_name=source["name"],
+            iso_path=iso_path,
         )
     else:
         policy = resolve_disc_filter_policy(
@@ -6798,6 +6872,7 @@ def _run_single_remux_task(
             simplify_subs=policy.simplify_subs,
             keep_temp=keep_temp,
             source_name=source["name"],
+            iso_path=iso_path,
         )
 
     if result == "success":
@@ -7005,7 +7080,6 @@ def main():
     try:
         # 检查工具链
         check_tools()
-        print()
 
         # 清理路径参数
         root_dir = clean_path(args.input)
