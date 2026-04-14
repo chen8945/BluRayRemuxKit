@@ -883,6 +883,64 @@ def require_tools(tool_names: List[str], console: Optional[Console] = None) -> N
         raise RuntimeError(f"工具不可用：{', '.join(missing_parts)}")
 
 
+MAKEMKV_KEY_INVALID_PATTERN = re.compile(
+    r"registration key to continue|Evaluation period has expired|This application version is too old|registration key.*invalid|Cannot parse registration key|Your registration key has expired",
+    re.IGNORECASE,
+)
+
+
+def _get_container_makemkv_runtime_unavailable_reason() -> Optional[str]:
+    """读取容器入口脚本传入的 MakeMKV 运行态标记。"""
+    runtime_state = os.environ.get("BLURAY_REMUX_MAKEMKV_AVAILABLE")
+    if runtime_state == "0":
+        return os.environ.get("BLURAY_REMUX_MAKEMKV_REASON") or "容器启动时未能完成 MakeMKV 可用性校验"
+    if runtime_state == "1":
+        return None
+    return None
+
+
+def _probe_local_makemkv_runtime_unavailable_reason() -> Optional[str]:
+    """探测本地直跑场景下的 MakeMKV 可用性。"""
+    statuses = _collect_tool_status(["makemkvcon"])
+    if statuses["missing"]:
+        return f"本地环境缺少 MakeMKV 工具：{', '.join(statuses['missing'])}"
+    if statuses["broken"]:
+        return f"本地 MakeMKV 工具无法正常运行：{', '.join(statuses['broken'])}"
+    if statuses["permission"]:
+        return f"本地 MakeMKV 工具缺少执行权限：{', '.join(Path(path).name for path in statuses['permission'])}"
+
+    if get_makemkv_profile_path() is None:
+        return "本地 MakeMKV profile 配置文件不可用"
+
+    try:
+        result = subprocess.run(
+            [require_executable("makemkvcon"), "-r", "info", "disc:9999"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=15,
+            creationflags=NO_WINDOW_CREATION_FLAGS,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "本地 MakeMKV 工具无法完成运行态校验"
+
+    output_text = f"{result.stdout or ''}{result.stderr or ''}"
+    if MAKEMKV_KEY_INVALID_PATTERN.search(output_text):
+        return "本地 MakeMKV key 已失效或不可用"
+    return None
+
+
+@lru_cache(maxsize=1)
+def get_makemkv_runtime_unavailable_reason() -> Optional[str]:
+    """返回当前运行环境下 MakeMKV 不可用原因；可用时返回 None。"""
+    container_reason = _get_container_makemkv_runtime_unavailable_reason()
+    if container_reason is not None or os.environ.get("BLURAY_REMUX_MAKEMKV_AVAILABLE") == "1":
+        return container_reason
+    return _probe_local_makemkv_runtime_unavailable_reason()
+
+
 def _mkvmerge_identify_has_video_track(output: str) -> bool:
     """判断 mkvmerge -i 输出是否包含视频轨。"""
     return bool(MKVMERGE_VIDEO_TRACK_PATTERN.search(output or ""))
@@ -6022,6 +6080,12 @@ def prepare_disc_session(
         bdinfo_data = bdinfo_outcome.data
 
         processing_decision = resolve_processing_mode(chapter, console, makemkv_mode=makemkv_mode, skip_interactive=skip_interactive)
+        makemkv_unavailable_reason = get_makemkv_runtime_unavailable_reason()
+        if processing_decision.get("processing_mode") == "problem_fallback" and makemkv_unavailable_reason:
+            console.print(
+                f"[yellow]提示：当前原盘需要 MakeMKV 兜底，但 MakeMKV 当前不可用（{makemkv_unavailable_reason}），已跳过该原盘。[/yellow]"
+            )
+            return DiscPreparationResult(action="skip_disc", error=f"MakeMKV 当前不可用：{makemkv_unavailable_reason}")
 
         try:
             tracks = workflow_phase3_scan_tracks(bdmv_path, chapter, console, verbose=scan_tracks_verbose)
@@ -6316,6 +6380,11 @@ def main_workflow(
         source_tracks = session.source_tracks
         processing_decision = session.processing_decision
 
+    makemkv_unavailable_reason = get_makemkv_runtime_unavailable_reason()
+    if processing_decision.get("processing_mode") == "problem_fallback" and makemkv_unavailable_reason:
+        console.print(f"[yellow]提示：当前原盘需要 MakeMKV 兜底，但 MakeMKV 当前不可用（{makemkv_unavailable_reason}），已跳过该原盘。[/yellow]")
+        return "skipped"
+
     # 阶段 6：提取元数据
     title, metadata, chapters_file = workflow_phase6_extract_metadata(bdmv_path, chapter, output_dir, console)
 
@@ -6337,6 +6406,11 @@ def main_workflow(
     )
 
     if not success and initial_processing_mode != "problem_fallback" and processing_decision.get("processing_mode") == "problem_fallback":
+        if makemkv_unavailable_reason:
+            console.print(
+                f"[yellow]提示：当前原盘需要切换到 MakeMKV 兜底，但 MakeMKV 当前不可用（{makemkv_unavailable_reason}），已跳过该原盘。[/yellow]"
+            )
+            return "skipped"
         console.print("[yellow]切换到问题盘兜底路径后重试 Remux...[/yellow]")
         success, processing_decision = workflow_phase7_remux(
             output_dir,
@@ -6713,7 +6787,7 @@ def _preconfirm_single_disc(
             return "prev"
 
         if preparation.action == "skip_disc":
-            task["preconfirm_error"] = "播放列表不匹配，用户选择跳过"
+            task["preconfirm_error"] = preparation.error or "播放列表不匹配，用户选择跳过"
             return "next"
 
         if preparation.action == "error":
@@ -7150,10 +7224,24 @@ def main():
             console.print(
                 "[yellow]提示：已启用 --keep-temp，脚本将忽略 --delete-source，并保留源文件、BDInfo、临时章节文件及问题盘临时文件；未完成的 .tmp 与空输出目录仍会自动清理。[/yellow]"
             )
-        if args.skip_interactive and args.makemkv_mode == "ask":
-            console.print("[yellow]提示：已启用 --skip-interactive，--makemkv-mode ask 将退化为 auto。[/yellow]")
+        makemkv_unavailable_reason = get_makemkv_runtime_unavailable_reason()
+        if makemkv_unavailable_reason:
+            console.print(f"[yellow]提示：MakeMKV 当前不可用（{makemkv_unavailable_reason}）。[/yellow]")
 
         global_makemkv_mode = args.makemkv_mode
+        if makemkv_unavailable_reason and args.makemkv_mode in {"force", "ask"}:
+            console.print(
+                f"[yellow]提示：检测到 MakeMKV 当前不可用，--makemkv-mode {args.makemkv_mode} 将回退为 auto。[/yellow]"
+            )
+            if args.skip_interactive:
+                global_makemkv_mode = "auto"
+            else:
+                if not Confirm.ask("[yellow]是否继续处理？[/yellow]", default=True):
+                    raise UserAbortError("MakeMKV 不可用，用户取消继续处理")
+                global_makemkv_mode = "auto"
+        elif args.skip_interactive and args.makemkv_mode == "ask":
+            console.print("[yellow]提示：已启用 --skip-interactive，--makemkv-mode ask 将退化为 auto。[/yellow]")
+            global_makemkv_mode = "auto"
 
         # 阶段 1：扫描原盘
         sources = batch_phase1_scan_sources(root_dir, console)

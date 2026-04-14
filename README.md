@@ -49,6 +49,7 @@
   - 某些分段缺少可被 `mkvmerge` 识别的视频轨。
   - 分段追加时出现 `--append-to` 轨道对不上的情况。
 - 问题盘会切换到 `MakeMKV` 兜底路径：
+  - **异常跳过：** 如果当前环境中 MakeMKV 不可用（如 Docker 容器内抓取 Key 失败、本地工具丢失/Key 过期），脚本将输出警告提示，并**自动跳过该原盘**，继续处理下一个。
   - 先用 `makemkvcon -r info` 读取原盘并按 `TINFO:16` 精确匹配目标 `MPLS`。
   - 再按配置文件导出对应标题为临时 MKV，并基于 `mkvmerge -J` 做轨道回绑。
   - 最终由 `mkvmerge` 以“单输入临时 MKV”完成封装。
@@ -75,6 +76,9 @@
 | | `yes` / `ask` / 不传 | 精简外语字幕（英语/原语言仅保留一条最优）（默认行为） |
 | `--makemkv-mode`<br>*(注：单段盘均不参与)* | `force` | 跳过 `mkvmerge` 预检查，强制使用 `MakeMKV` |
 | | `auto` / `ask` / 不传 | 按默认逻辑自动检测（默认行为） |
+
+> **💡 MakeMKV 可用性退化规则：**
+> 无论是否开启静默模式，如果脚本检测到当前环境 MakeMKV 工具不可用，且传入了 `--makemkv-mode force` 或 `--makemkv-mode ask`，脚本会自动将其退化为 `auto` 模式。在非静默模式下，脚本会额外弹出提示询问用户是否继续处理。
 
 ---
 ## BDInfo 匹配与输入
@@ -126,8 +130,9 @@ docker pull ghcr.io/chen8945/bluray-remuxkit:latest
 ```
 
 - 镜像内已内置 `makemkvcon`、`default.mmcp.xml` 和 `settings.conf`。
-- 构建时会自动抓取官方论坛最新 `MakeMKV` beta key，容器启动时会再次校验；若 key 失效，会联网刷新。
-- 因此 Docker 运行阶段不能再使用 `--network none`，否则 key 自动刷新会失败。
+- 构建时会自动抓取官方论坛最新 `MakeMKV` beta key，容器启动时会再次校验。
+- 若 key 失效，容器会联网自动刷新抓取（默认包含 5 次重试机制）。
+- **无感降级：** 建议保持网络畅通。如果在完全断网（如使用了 `--network none`）或多次抓取均失败的情况下，容器**不会**启动崩溃，而是会安全禁用 MakeMKV 兜底功能并继续启动。遇到需要 MakeMKV 兜底的问题盘时则会自动跳过。
 
 ### 前提条件
 - 宿主机必须是 **Linux**。
