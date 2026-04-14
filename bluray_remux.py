@@ -534,7 +534,6 @@ def resolve_disc_filter_policy(
 ) -> DiscFilterPolicy:
     """统一解析单盘过滤策略，减少批量预确认与正式处理的重复逻辑。"""
 
-    # 判断是否真的需要弹出交互询问
     needs_prompt = not skip_interactive and (global_drop_commentary is None or global_keep_best_audio is None or global_simplify_subs is None)
 
     if source_name:
@@ -991,7 +990,12 @@ def probe_multi_segment_video_tracks(stream_dir: Path, segment_names: List[str],
     return True, None
 
 
-def resolve_processing_mode(chapter: "Chapter", console: Console) -> Dict[str, Any]:
+def resolve_processing_mode(
+    chapter: "Chapter",
+    console: Console,
+    makemkv_mode: Literal["auto", "force", "ask"] = "auto",
+    skip_interactive: bool = False,
+) -> Dict[str, Any]:
     """根据分段数与预检查结果决定处理路径。"""
     segment_names = chapter.get_m2ts_files()
     segment_count = len(segment_names)
@@ -1005,7 +1009,26 @@ def resolve_processing_mode(chapter: "Chapter", console: Console) -> Dict[str, A
     }
 
     if not is_multi_segment:
-        console.print("[green]检测到单段播放列表；跳过分段检测，继续原流程。[/green]")
+        if makemkv_mode == "force":
+            debug_print("[green]检测到单段播放列表；--makemkv-mode 仅对多段盘生效，继续原流程。[/green]")
+        else:
+            debug_print("[green]检测到单段播放列表；跳过分段检测，继续原流程。[/green]")
+        return decision
+
+    effective_makemkv_mode = makemkv_mode
+    if effective_makemkv_mode == "ask" and not skip_interactive:
+        effective_makemkv_mode = Prompt.ask(
+            "[yellow]当前原盘为多段播放列表，MakeMKV 处理策略[/yellow]\n  [cyan]auto[/cyan] : 按脚本默认逻辑自动检测 (默认)\n  [cyan]force[/cyan]: 跳过 mkvmerge 预检查，直接先走 MakeMKV\n请选择",
+            choices=["auto", "force"],
+            default="auto",
+        )
+    elif effective_makemkv_mode == "ask":
+        effective_makemkv_mode = "auto"
+
+    if effective_makemkv_mode == "force":
+        decision["problem_reason"] = "forced_by_cli"
+        decision["processing_mode"] = "problem_fallback"
+        console.print("[yellow]已启用 force 模式：跳过 mkvmerge 预检查，直接走 MakeMKV 路径。[/yellow]")
         return decision
 
     stream_dir = Path(chapter.file_path).parent.parent / "STREAM"
@@ -5957,6 +5980,7 @@ def prepare_disc_session(
     simplify_subs: bool,
     skip_interactive: bool,
     console: Console,
+    makemkv_mode: Literal["auto", "force", "ask"] = "auto",
     source_name: Optional[str] = None,
     preferred_playlist: Optional[str] = None,
     auto_skip_mpls: bool = True,
@@ -5997,7 +6021,7 @@ def prepare_disc_session(
             return DiscPreparationResult(action="skip_disc")
         bdinfo_data = bdinfo_outcome.data
 
-        processing_decision = resolve_processing_mode(chapter, console)
+        processing_decision = resolve_processing_mode(chapter, console, makemkv_mode=makemkv_mode, skip_interactive=skip_interactive)
 
         try:
             tracks = workflow_phase3_scan_tracks(bdmv_path, chapter, console, verbose=scan_tracks_verbose)
@@ -6218,6 +6242,7 @@ def main_workflow(
     drop_commentary: bool = False,
     keep_best_audio: bool = False,
     simplify_subs: bool = True,
+    makemkv_mode: Literal["auto", "force", "ask"] = "auto",
     keep_temp: bool = False,
     source_name: Optional[str] = None,
     iso_path: Optional[Path] = None,
@@ -6235,6 +6260,7 @@ def main_workflow(
         drop_commentary: 是否全局剔除导评轨
         keep_best_audio: 是否每种语言仅保留最优音轨
         simplify_subs: 是否精简外语字幕（英语/原语言仅保留排序最优的一条）
+        makemkv_mode: MakeMKV 处理策略（auto=自动检测, force=直接走 MakeMKV, ask=多段盘逐盘询问）
         keep_temp: 是否保留临时章节文件及问题盘外部化路径的中间文件；启用后会忽略 delete_source，但未完成的 .tmp 与空输出目录仍会清理
         source_name: 原盘名称（可选，传入以便在交互界面的表格中提示用户）
     """
@@ -6268,6 +6294,7 @@ def main_workflow(
             drop_commentary=drop_commentary,
             keep_best_audio=keep_best_audio,
             simplify_subs=simplify_subs,
+            makemkv_mode=makemkv_mode,
             skip_interactive=skip_interactive,
             console=console,
             source_name=source_name,
@@ -6370,6 +6397,13 @@ def parse_arguments():
     )
     parser.add_argument(
         "--simplify-subs", type=str, choices=["no", "yes", "ask"], default=None, help="精简外语字幕 (yes仅留最优/no保留所有/ask单盘询问)"
+    )
+    parser.add_argument(
+        "--makemkv-mode",
+        type=str,
+        choices=["auto", "force", "ask"],
+        default="auto",
+        help="MakeMKV 处理策略，仅对多段播放列表生效 (auto自动检测/force直接先走MakeMKV/ask逐盘询问)",
     )
     parser.add_argument("--delete-source", action="store_true", help="处理成功后自动删除原盘文件 (ISO 或文件夹) (谨慎使用)")
     parser.add_argument(
@@ -6603,6 +6637,7 @@ def _preconfirm_single_disc(
     global_drop_commentary: Optional[bool],
     global_keep_best_audio: Optional[bool],
     global_simplify_subs: Optional[bool],
+    global_makemkv_mode: Literal["auto", "force", "ask"],
     console: Console,
 ) -> Literal["next", "prev"]:
     """
@@ -6622,6 +6657,7 @@ def _preconfirm_single_disc(
         global_drop_commentary: 全局导评策略（True=丢弃, False=保留, None=逐盘询问）
         global_keep_best_audio: 全局精简策略（True=精简, False=不精简, None=逐盘询问）
         global_simplify_subs: 全局外语字幕精简策略（True=精简, False=保留, None=逐盘询问）
+        global_makemkv_mode: 全局 MakeMKV 策略（auto=自动检测, force=强制使用, ask=逐盘询问）
         console: Rich Console 对象
 
     Returns:
@@ -6653,6 +6689,7 @@ def _preconfirm_single_disc(
             drop_commentary=policy.drop_commentary,
             keep_best_audio=policy.keep_best_audio,
             simplify_subs=policy.simplify_subs,
+            makemkv_mode=global_makemkv_mode,
             skip_interactive=False,
             console=console,
             source_name=source["name"],
@@ -6704,6 +6741,7 @@ def batch_phase3_5_preconfirm(
     global_drop_commentary: Optional[bool],
     global_keep_best_audio: Optional[bool],
     global_simplify_subs: Optional[bool],
+    global_makemkv_mode: Literal["auto", "force", "ask"],
     console: Console,
 ) -> None:
     """
@@ -6715,6 +6753,7 @@ def batch_phase3_5_preconfirm(
         global_drop_commentary: 全局导评策略
         global_keep_best_audio: 全局音轨精简策略
         global_simplify_subs: 全局外语字幕精简策略
+        global_makemkv_mode: 全局 MakeMKV 策略
         console: Rich Console对象
 
     Notes:
@@ -6749,6 +6788,7 @@ def batch_phase3_5_preconfirm(
                     global_drop_commentary,
                     global_keep_best_audio,
                     global_simplify_subs,
+                    global_makemkv_mode,
                     console,
                 )
 
@@ -6786,6 +6826,7 @@ def _run_single_remux_task(
     global_drop_commentary: Optional[bool],
     global_keep_best_audio: Optional[bool],
     global_simplify_subs: Optional[bool],
+    global_makemkv_mode: Literal["auto", "force", "ask"],
     keep_temp: bool,
     mount_manager: Optional[ISOmountManager],
     console: Console,
@@ -6804,6 +6845,7 @@ def _run_single_remux_task(
         global_drop_commentary: 全局导评策略（True=丢弃, False=保留, None=逐盘询问）
         global_keep_best_audio: 全局音轨精简策略（True=精简, False=不精简, None=逐盘询问）
         global_simplify_subs: 全局外语字幕精简策略（True=精简, False=保留, None=逐盘询问）
+        global_makemkv_mode: 全局 MakeMKV 策略（auto=自动检测, force=强制使用, ask=逐盘询问）
         mount_manager: ISO 挂载管理器
         console: Rich Console 对象
 
@@ -6870,6 +6912,7 @@ def _run_single_remux_task(
             drop_commentary=policy.drop_commentary,
             keep_best_audio=policy.keep_best_audio,
             simplify_subs=policy.simplify_subs,
+            makemkv_mode=global_makemkv_mode,
             keep_temp=keep_temp,
             source_name=source["name"],
             iso_path=iso_path,
@@ -6898,6 +6941,7 @@ def batch_phase4_remux(
     global_drop_commentary: Optional[bool],
     global_keep_best_audio: Optional[bool],
     global_simplify_subs: Optional[bool],
+    global_makemkv_mode: Literal["auto", "force", "ask"],
     delete_source: bool,
     keep_temp: bool,
     console: Console,
@@ -6914,6 +6958,7 @@ def batch_phase4_remux(
         global_drop_commentary: 全局导评策略
         global_keep_best_audio: 全局音轨精简策略
         global_simplify_subs: 全局外语字幕精简策略
+        global_makemkv_mode: 全局 MakeMKV 策略
         delete_source: 处理成功后是否自动删除原盘文件及当前任务绑定的 BDInfo 缓存（危险操作）
         keep_temp: 是否保留临时章节文件与问题盘中间文件；启用后会忽略 delete_source，但未完成的 .tmp 与空输出目录仍会清理
         console: Rich Console对象
@@ -6953,6 +6998,7 @@ def batch_phase4_remux(
                     global_drop_commentary,
                     global_keep_best_audio,
                     global_simplify_subs,
+                    global_makemkv_mode,
                     keep_temp,
                     mount_manager,
                     console,
@@ -7104,6 +7150,10 @@ def main():
             console.print(
                 "[yellow]提示：已启用 --keep-temp，脚本将忽略 --delete-source，并保留源文件、BDInfo、临时章节文件及问题盘临时文件；未完成的 .tmp 与空输出目录仍会自动清理。[/yellow]"
             )
+        if args.skip_interactive and args.makemkv_mode == "ask":
+            console.print("[yellow]提示：已启用 --skip-interactive，--makemkv-mode ask 将退化为 auto。[/yellow]")
+
+        global_makemkv_mode = args.makemkv_mode
 
         # 阶段 1：扫描原盘
         sources = batch_phase1_scan_sources(root_dir, console)
@@ -7173,6 +7223,7 @@ def main():
                 global_drop_commentary,
                 global_keep_best_audio,
                 global_simplify_subs,
+                global_makemkv_mode,
                 console,
             )
 
@@ -7186,6 +7237,7 @@ def main():
             global_drop_commentary,
             global_keep_best_audio,
             global_simplify_subs,
+            global_makemkv_mode,
             args.delete_source,
             args.keep_temp,
             console,
