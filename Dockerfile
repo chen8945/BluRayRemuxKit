@@ -72,8 +72,8 @@ RUN ./configure \
         --disable-everything \
         --enable-protocol=file,pipe \
         --enable-demuxer=mpegts,mpegtsraw,mov,matroska \
-        --enable-parser=hevc,h264,av1,aac,ac3,dca,mlp,mpegvideo,mpeg4video \
-        --enable-decoder=hevc,h264,av1,aac,ac3,eac3,truehd,mlp,dca,flac,pcm_bluray,hdmv_pgs_subtitle \
+        --enable-parser=hevc,h264,vc1,aac,ac3,dca,mlp,mpegvideo,mpeg4video \
+        --enable-decoder=hevc,h264,vc1,aac,ac3,eac3,truehd,mlp,dca,flac,pcm_bluray,hdmv_pgs_subtitle \
         --disable-shared \
         --enable-static \
     && make -j"$(nproc)" ffprobe \
