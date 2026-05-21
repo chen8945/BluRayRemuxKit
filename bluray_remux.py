@@ -2127,13 +2127,11 @@ def _compute_region_weight(text: str) -> int:
         text: 待分析的文本（轨道名或描述）
 
     Returns:
-        权重值（0-100），无地区标识返回 0
+        正整数权重值，无地区标识返回 0。越靠前的地区关键词权重越高，所有命中地区都高于无地区。
 
     Examples:
-        >>> _compute_region_weight("央视国语 DTS-HD MA")
-        100  # "央视" 是列表第一个
-        >>> _compute_region_weight("六区国语 AC3")
-        50   # "六区" 权重较低
+        >>> _compute_region_weight("公映国语 DTS-HD MA") > _compute_region_weight("六区国语 AC3") > 0
+        True
     """
     if not text:
         return 0
@@ -2144,10 +2142,10 @@ def _compute_region_weight(text: str) -> int:
     # 使用 TRACK_KEYWORDS 中的地区关键词列表
     region_keywords = TRACK_KEYWORDS["region"]
 
-    # 遍历关键词，按顺序赋予递减的权重
+    # 遍历关键词，按顺序赋予递减的正权重；未命中返回 0，确保所有命中地区都优先于无地区。
     for idx, keyword in enumerate(region_keywords):
         if keyword in normalized_text:
-            return 100 - (idx * 10)
+            return len(region_keywords) - idx
 
     return 0
 
@@ -2423,7 +2421,7 @@ class TrackSorter:
 
         排序优先级（权重越大越靠前）：
         1. 位置权重 (黑边 > 画内 > 无位置)
-        2. 类型权重 (双语特效 > 特效 > 原盘 > 导评)
+        2. 类型权重 (双语特效 > 双语 > 国配特效 > 普通中文特效 > 粤/台/港配特效 > 原盘 > 导评)
         3. 地区权重 (八一公映 > 央视 > 六区等)
         4. 语言权重 (中文简繁 > 原语言 > 英语)
         5. SDH 权重 (正常字幕排在听障字幕前)
@@ -2468,7 +2466,7 @@ class TrackSorter:
 
         return 0
 
-    def _subtitle_type_weight(self, desc: str) -> int:
+    def _subtitle_type_weight(self, desc: str) -> float:
         """字幕类型权重（根据描述关键词）"""
         if not desc:  # 处理 None 或空字符串
             return 0
@@ -2484,9 +2482,13 @@ class TrackSorter:
         if "双语" in desc:
             return 9
 
-        # 单语特效（第二优先级）
+        # 单语特效：在 type_weight 内细分国配、普通中文、粤/台/港配，让简繁字幕成对排列
         if "特效" in desc and "双语" not in desc:
-            return 8
+            if any(kw in desc for kw in TRACK_KEYWORDS["mandarin"]):
+                return 8.3
+            if any(kw in desc for kw in TRACK_KEYWORDS["dialect"]):
+                return 8.1
+            return 8.2
 
         # 其他特殊类型（港/台/粤语，但不是原盘）
         if any(kw in desc for kw in ["港", "台", "粤语"]) and "原盘" not in desc:
@@ -4572,7 +4574,7 @@ def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
     ]
     last_line_was_progress = False
 
-    mkvmerge_verbose_blacklist = ["格式输出模块", "格式分离器", "output module", "demultiplexer"]
+    mkvmerge_verbose_blacklist = ["提取宽高比信息", "格式输出模块", "格式分离器", "追加合并到文件", "Extracted the aspect ratio information", "Using the output module", "Using the demultiplexer", "from file no"]
 
     def _is_progress_line(text: str) -> bool:
         stripped = text.strip()
