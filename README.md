@@ -130,7 +130,7 @@ docker pull ghcr.io/chen8945/bluray-remuxkit:latest
 ```
 
 - 镜像内已内置 `makemkvcon`、`default.mmcp.xml` 和 `settings.conf`。
-- 构建时会自动抓取官方论坛最新 `MakeMKV` beta key，容器启动时会再次校验。
+- 构建时会优先从第三方接口抓取最新 `MakeMKV` beta key，并在失败时回退到官方论坛；容器启动时会再次校验。
 - 若 key 失效，容器会联网自动刷新抓取（默认包含 5 次重试机制）。
 - **无感降级：** 建议保持网络畅通。如果在完全断网（如使用了 `--network none`）或多次抓取均失败的情况下，容器**不会**启动崩溃，而是会安全禁用 MakeMKV 兜底功能并继续启动。遇到需要 MakeMKV 兜底的问题盘时则会自动跳过。
 

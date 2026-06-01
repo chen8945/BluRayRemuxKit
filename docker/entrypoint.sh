@@ -45,10 +45,11 @@ mark_makemkv_unavailable() {
 
 update_settings_key() {
   key="$1"
-  if grep -q '^app_Key=' "$SETTINGS_FILE"; then
-    sed -i "s|^app_Key=.*$|app_Key=$key|" "$SETTINGS_FILE"
+  escaped_key="$(printf '%s\n' "$key" | sed 's/[&|]/\\&/g')"
+  if grep -Eq '^[[:space:]]*app_Key[[:space:]]*=' "$SETTINGS_FILE"; then
+    sed -i "s|^[[:space:]]*app_Key[[:space:]]*=.*$|app_Key = \"$escaped_key\"|" "$SETTINGS_FILE"
   else
-    printf 'app_Key=%s\n' "$key" >> "$SETTINGS_FILE"
+    printf 'app_Key = "%s"\n' "$key" >> "$SETTINGS_FILE"
   fi
 }
 
@@ -95,7 +96,7 @@ ensure_valid_makemkv_key() {
     return 0
   fi
 
-  echo "MakeMKV key 已失效，正在从官方论坛抓取最新 beta key..." >&2
+  echo "MakeMKV key 已失效，正在抓取最新 beta key..." >&2
   if ! refresh_makemkv_key; then
     mark_makemkv_unavailable "警告：MakeMKV key 自动刷新失败，当前将禁用 MakeMKV 并继续启动容器。"
     return 0
