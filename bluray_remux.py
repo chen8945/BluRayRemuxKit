@@ -4318,6 +4318,10 @@ def map_tracks_to_temp_mkv(
     used_temp_ids: Set[int] = set()
     track_sources: Dict[int, Dict[str, Any]] = {}
     failures: List[str] = []
+    # MakeMKV 会把双层杜比视界（基础层 + 增强层）原盘合并为单条视频轨，
+    # 因此源视频轨可能多于临时 MKV 的视频轨。多出的增强层无对应临时轨，
+    # 记录为“已合并丢弃”而非回绑失败（其数据已并入保留的主视频轨）。
+    dropped_video_tracks: List[Track] = []
 
     for source_track in ordered_selected:
         candidates = [track for track in temp_by_type[source_track.type] if track["id"] not in used_temp_ids]
@@ -4333,9 +4337,25 @@ def map_tracks_to_temp_mkv(
                 candidates = pid_candidates
             elif pid_candidates:
                 candidates = pid_candidates
+            elif source_track.type == "video":
+                # 无同 PID 临时轨的视频轨（增强层）不得抢占其它视频轨独占的同 PID 临时轨，
+                # 保证基础层始终绑定到对应的临时视频轨，被丢弃的才是增强层。
+                reserved_pids = {
+                    other.source_pid
+                    for other in ordered_selected
+                    if other is not source_track and other.type == "video" and other.source_pid
+                }
+                candidates = [track for track in candidates if track.get("source_id") not in reserved_pids]
 
         compatible = [track for track in candidates if _is_temp_track_compatible(source_track, track)]
         if not compatible:
+            if source_track.type == "video" and temp_by_type["video"]:
+                # MakeMKV 已输出至少一条视频轨，多出的源视频轨为已被合并的增强层，丢弃即可。
+                dropped_video_tracks.append(source_track)
+                debug_print(
+                    f"[yellow][debug] MakeMKV 视频轨已合并丢弃（增强层并入主视频轨）: {_format_track_debug(source_track)}[/yellow]"
+                )
+                continue
             failures.append(
                 f"{source_track.display_id} type={source_track.type} pid={source_track.source_pid_hex or source_track.source_pid or '-'} "
                 f"codec={source_track.codec or '-'} lang={source_track.language}"
@@ -4353,9 +4373,10 @@ def map_tracks_to_temp_mkv(
         }
         debug_print(f"[green][debug] MakeMKV 回绑: {_format_track_debug(source_track)} <= {_format_temp_track_debug(selected_temp)}[/green]")
 
-    if failures or len(track_sources) != len(selected_tracks):
-        mapped_ids = set(track_sources)
-        missing_tracks = [track for track in selected_tracks if track.id not in mapped_ids]
+    mapped_ids = set(track_sources)
+    dropped_ids = {track.id for track in dropped_video_tracks}
+    missing_tracks = [track for track in selected_tracks if track.id not in mapped_ids and track.id not in dropped_ids]
+    if failures or missing_tracks:
         for track in missing_tracks:
             failures.append(f"{track.display_id} type={track.type} pid={track.source_pid_hex or track.source_pid or '-'} codec={track.codec or '-'}")
 
@@ -4447,7 +4468,15 @@ def extract_tracks_with_makemkv(
 
         temp_tracks = scan_temp_mkv_tracks(temp_mkv_path)
         track_sources = map_tracks_to_temp_mkv(source_tracks, effective_selected_tracks, temp_tracks, temp_mkv_path)
-        return track_sources, temp_mkv_path, effective_selected_tracks, ignored_hidden_tracks
+        # MakeMKV 合并双层杜比视界后，未能回绑的多余视频轨（增强层）已并入主视频轨，从封装集合中剔除。
+        bound_selected_tracks = [track for track in effective_selected_tracks if track.id in track_sources]
+        merged_video_tracks = [track for track in effective_selected_tracks if track.id not in track_sources]
+        if merged_video_tracks:
+            merged_ids = ", ".join(track.display_id for track in merged_video_tracks)
+            console.print(
+                f"[yellow]提示：MakeMKV 已将双层杜比视界增强层合并入主视频轨，跳过冗余视频轨：{merged_ids}[/yellow]"
+            )
+        return track_sources, temp_mkv_path, bound_selected_tracks, ignored_hidden_tracks
     except BaseException:
         if not reuse_existing:
             temp_cleanup_registry.add_paths(temp_output_dir.rglob("*"))
@@ -6255,9 +6284,8 @@ def workflow_phase7_remux(
                 reuse_existing=keep_temp,
                 console=console,
             )
-            if ignored_hidden_tracks:
-                # 保持后续摘要与实际封装一致
-                tracks[:] = effective_tracks
+            # 同步实际封装的轨道集合（剔除隐藏轨或被 MakeMKV 合并的增强层后），保持后续摘要与封装一致
+            tracks[:] = effective_tracks
             generated_cleanup = CleanupRegistry(effective_chapters_file, temp_mkv_path.parent, temp_mkv_path.parent.parent)
             generated_cleanup.add_track_sources(track_sources)
             cmd = build_mkvmerge_command_for_temp_mkv(
