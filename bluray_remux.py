@@ -137,7 +137,7 @@ SPECIAL_LANGUAGE_NAMES = {
 TRACK_KEYWORDS = {
     "region": [
     # 院线与公映版
-    "八一公映", "长影公映", "中影公映", "公映", "中影", 
+    "八一公映", "长影公映", "中影公映", "长译公映", "北影公映", "公映", "中影", 
     # 经典译制厂与配音机构
     "东影上译", "东影", "上译", "央视长译", "长译", "京译", "北影", 
     "辽艺", "八一", "央视",
@@ -168,14 +168,56 @@ BITRATE_MBPS_PATTERN = r"([\d.]+)\s*Mbps"
 SDH_PATTERN = re.compile(r"(?i)\s*\(?(SDH|CC|听障|聋哑)\)?")
 BDINFO_PASTE_SENTINEL = "EOF"
 MKVMERGE_VIDEO_TRACK_PATTERN = re.compile(r"\bID\s+\d+:\s+video\b", re.IGNORECASE)
+# 问题盘错误规则：mode=any 表示命中任一模式即可，mode=all 表示必须全部命中。
+# 这些规则只用于识别已知的多段盘回退特征，不代表所有 mkvmerge 失败原因。
 PROBLEM_DISC_ERROR_PATTERNS = [
-    ("audio_channels_mismatch", [r"声道数不同|channels are different"]),
-    ("append_missing_track", [r"没有轨道可以追加到该轨道|there is no track to append|no track can be appended", r"不含 ID 为|does not contain a track with the ID", r"--append-to.+(?:无效|invalid)",],),
-    ("append_track_mismatch", [r"无法追加到|cannot (?:append|be appended to)"]),
+    {
+        # 追加音轨时，输入文件与目标文件的声道布局不一致。
+        "reason": "audio_channels_mismatch",
+        "mode": "any",
+        "patterns": [
+            r"声道数不同",
+            r"channels are different",
+        ],
+    },
+    {
+        # 输入数据无效，mkvmerge 已明确提示可能发生音视频不同步。
+        "reason": "invalid_data_desync",
+        "mode": "any",
+        "patterns": [
+            r"无效数据.*跳过处理.*(?:不同步|音频/视频可能发生不同步)",
+            r"invalid data.*skipping.*(?:out of sync|audio/video may be desynchronized)",
+        ],
+    },
+    {
+        # 追加目标轨道不存在，或 --append-to 指向了无效轨道。
+        "reason": "append_missing_track",
+        "mode": "any",
+        "patterns": [
+            r"没有轨道可以追加到该轨道",
+            r"there is no track to append",
+            r"no track can be appended",
+            r"不含 ID 为",
+            r"does not contain a track with the ID",
+            r"--append-to.+(?:无效|invalid)",
+            r"请求了 ID 为.*的轨道但在文件中没有找到",
+            r"A track with the ID.*was requested but not found in the file",
+        ],
+    },
+    {
+        # mkvmerge 明确报告当前轨道无法追加，通常表示轨道类型或参数不匹配。
+        "reason": "append_track_mismatch",
+        "mode": "any",
+        "patterns": [
+            r"无法追加到",
+            r"cannot (?:append|be appended to)",
+        ],
+    },
 ]
+# 这些警告通常不会导致命令失败，分类前会移除，避免误判为问题盘。
 MKVMERGE_BENIGN_WARNING_PATTERNS = [
-    re.compile(r"无效数据.*跳过处理.*(?:不同步|音频/视频可能发生不同步)", re.IGNORECASE),
-    re.compile(r"invalid data.*skipping.*(?:out of sync|audio/video may be desynchronized)", re.IGNORECASE),
+    # re.compile(r"无效数据.*跳过处理.*(?:不同步|音频/视频可能发生不同步)", re.IGNORECASE),
+    # re.compile(r"invalid data.*skipping.*(?:out of sync|audio/video may be desynchronized)", re.IGNORECASE),
 ]
 MAKEMKV_TINFO_PATTERN = re.compile(r'^TINFO:(\d+),(\d+),\d+,"(.*)"$')
 # fmt: on
@@ -590,23 +632,64 @@ TOOL_PROBE_ARGS = {
 DEFAULT_MAKEMKV_PROFILE_NAME = "default.mmcp.xml"
 
 
+def _iter_path_variants(path: Path) -> Iterable[Path]:
+    """按原始路径、真实路径顺序返回候选，兼容文件和目录软链接。"""
+    yield path
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return
+    if resolved != path:
+        yield resolved
+
+
+def _iter_executable_path_variants(path: Path) -> Iterable[Path]:
+    """返回可执行文件本身、真实路径及 Scoop shim 声明的目标路径。"""
+    seen: Set[str] = set()
+
+    def emit(candidate: Path) -> Iterable[Path]:
+        key = os.path.normcase(str(candidate))
+        if key not in seen:
+            seen.add(key)
+            yield candidate
+
+    for candidate in _iter_path_variants(path):
+        yield from emit(candidate)
+
+        if candidate.suffix.lower() != ".exe":
+            continue
+        shim_path = candidate.with_suffix(".shim")
+        if not shim_path.is_file():
+            continue
+        try:
+            shim_text = shim_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        match = re.search(r'^\s*path\s*=\s*"(.+?)"\s*$', shim_text, re.MULTILINE)
+        if not match:
+            continue
+        shim_target = clean_path(match.group(1))
+        for target in _iter_path_variants(shim_target):
+            yield from emit(target)
+
+
 def _resolve_path_entry(path_value: Optional[str], candidate_names: List[str], allow_windows_exe: bool = True) -> Optional[Path]:
     """将配置路径解析为文件路径；支持直接传文件或传目录后按候选名查找。"""
     if not path_value:
         return None
 
     path = clean_path(path_value)
-    if path.is_file():
-        return path
-    if not path.is_dir():
-        return None
-
     suffixes = ["", ".exe"] if allow_windows_exe and sys.platform.startswith("win") else [""]
-    for candidate_name in candidate_names:
-        for suffix in suffixes:
-            candidate_path = path / f"{candidate_name}{suffix}"
-            if candidate_path.is_file():
-                return candidate_path
+    for candidate_root in _iter_path_variants(path):
+        if candidate_root.is_file():
+            return candidate_root
+        if not candidate_root.is_dir():
+            continue
+        for candidate_name in candidate_names:
+            for suffix in suffixes:
+                candidate_path = candidate_root / f"{candidate_name}{suffix}"
+                if candidate_path.is_file():
+                    return candidate_path
     return None
 
 
@@ -768,18 +851,19 @@ def _resolve_makemkv_profile_entry(path_value: Optional[str]) -> Optional[Path]:
         return None
 
     path = clean_path(path_value)
-    if path.is_file():
-        return path
-    if not path.is_dir():
-        return None
+    for candidate_root in _iter_path_variants(path):
+        if candidate_root.is_file():
+            return candidate_root
+        if not candidate_root.is_dir():
+            continue
 
-    default_profile_path = path / DEFAULT_MAKEMKV_PROFILE_NAME
-    if default_profile_path.is_file():
-        return default_profile_path
+        default_profile_path = candidate_root / DEFAULT_MAKEMKV_PROFILE_NAME
+        if default_profile_path.is_file():
+            return default_profile_path
 
-    profile_candidates = sorted(candidate for candidate in path.glob("*.mmcp.xml") if candidate.is_file())
-    if len(profile_candidates) == 1:
-        return profile_candidates[0]
+        profile_candidates = sorted(candidate for candidate in candidate_root.glob("*.mmcp.xml") if candidate.is_file())
+        if len(profile_candidates) == 1:
+            return profile_candidates[0]
     return None
 
 
@@ -793,7 +877,19 @@ def get_makemkv_profile_path() -> Optional[Path]:
     if profile_path:
         return profile_path
 
-    return _resolve_makemkv_profile_entry(str(Path(__file__).parent))
+    profile_path = _resolve_makemkv_profile_entry(str(Path(__file__).parent))
+    if profile_path:
+        return profile_path
+
+    # makemkvcon 可能是软链接或 Scoop shim；检查入口目录和真实目标目录中的 profile。
+    makemkv_path = find_executable("makemkvcon")
+    if makemkv_path:
+        for executable_path in _iter_executable_path_variants(Path(makemkv_path)):
+            profile_path = _resolve_makemkv_profile_entry(str(executable_path.parent))
+            if profile_path:
+                return profile_path
+
+    return None
 
 
 def require_executable(tool_name: str) -> str:
@@ -971,9 +1067,19 @@ def _strip_known_benign_mkvmerge_warnings(output: str) -> str:
 def classify_problem_disc_error(output: str) -> Optional[str]:
     """识别多段盘原始直封失败是否属于已知问题盘特征。"""
     normalized = _strip_known_benign_mkvmerge_warnings(output or "")
-    for reason, patterns in PROBLEM_DISC_ERROR_PATTERNS:
-        if all(re.search(pattern, normalized, re.IGNORECASE) for pattern in patterns):
-            return reason
+
+    for rule in PROBLEM_DISC_ERROR_PATTERNS:
+        matches = [
+            bool(re.search(pattern, normalized, re.IGNORECASE))
+            for pattern in rule["patterns"]
+        ]
+
+        if rule["mode"] == "any" and any(matches):
+            return rule["reason"]
+
+        if rule["mode"] == "all" and all(matches):
+            return rule["reason"]
+
     return None
 
 
@@ -4570,7 +4676,7 @@ def cleanup_generated_paths(
             failed_paths.append(path)
 
     if cleaned_count and console:
-        console.print(f"[dim]已删除 {cleaned_count} 个中间产物[/dim]")
+        console.print(f"\n[dim]已删除 {cleaned_count} 个中间产物[/dim]")
     if failed_paths and console:
         failed_names = ", ".join(path.name for path in failed_paths[:5])
         more_count = len(failed_paths) - 5
@@ -4579,7 +4685,7 @@ def cleanup_generated_paths(
     return failed_paths
 
 
-def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
+def _run_subprocess_with_live_output(cmd: List[str], stop_on_problem_disc: bool = False) -> Tuple[int, str]:
     """执行外部命令并同步转发输出，同时收集完整文本。"""
     is_mkvmerge = any("mkvmerge" in str(c).lower() for c in cmd)
     process = subprocess.Popen(
@@ -4593,6 +4699,7 @@ def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
     )
 
     output_chunks = []
+    problem_reason: Optional[str] = None
     progress_patterns = [
         re.compile(r"^(analyze|process):\s+\d+%$", re.IGNORECASE),
         re.compile(r"^progress:\s*\d+%$", re.IGNORECASE),
@@ -4619,20 +4726,33 @@ def _run_subprocess_with_live_output(cmd: List[str]) -> Tuple[int, str]:
                     sys.stdout.flush()
                     last_line_was_progress = True
                 else:
-                    if is_mkvmerge and not DEBUG:
-                        if any(kw in line for kw in mkvmerge_verbose_blacklist):
-                            continue
+                    is_blacklisted = is_mkvmerge and not DEBUG and any(kw in line for kw in mkvmerge_verbose_blacklist)
+                    if not is_blacklisted:
+                        if last_line_was_progress:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                            last_line_was_progress = False
 
-                    if last_line_was_progress:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        last_line_was_progress = False
+                        print(line, end="")
 
-                    print(line, end="")
+                if stop_on_problem_disc:
+                    problem_reason = classify_problem_disc_error("".join(output_chunks))
+                    if problem_reason:
+                        print(f"\n检测到问题盘特征：{problem_reason}，中断当前 mkvmerge 进程。")
+                        process.terminate()
+                        break
 
         if last_line_was_progress:
             sys.stdout.write("\n")
             sys.stdout.flush()
+
+        if problem_reason and process.poll() is None:
+            process.terminate()
+        if problem_reason:
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
 
         return process.wait(), "".join(output_chunks)
     except BaseException:
@@ -4676,8 +4796,11 @@ def run_mkvmerge_with_progress(cmd: List[str], max_retries: int = 2, stop_on_pro
 
     for attempt in range(max_retries):
         try:
-            returncode, output_text = _run_subprocess_with_live_output(cmd)
+            returncode, output_text = _run_subprocess_with_live_output(cmd, stop_on_problem_disc=stop_on_problem_disc)
             problem_reason = classify_problem_disc_error(output_text) if stop_on_problem_disc else None
+
+            if problem_reason:
+                return {"success": False, "output": output_text, "returncode": returncode, "problem_reason": problem_reason}
 
             # mkvmerge 状态码: 0=完美, 1=有警告但成功, 2=严重错误
             if returncode in (0, 1):
@@ -4689,9 +4812,6 @@ def run_mkvmerge_with_progress(cmd: List[str], max_retries: int = 2, stop_on_pro
                     tmp_output.replace(final_output)
                 return {"success": True, "output": output_text, "returncode": returncode, "problem_reason": None}
             else:
-                if problem_reason:
-                    return {"success": False, "output": output_text, "returncode": returncode, "problem_reason": problem_reason}
-
                 # 返回码 >= 2 才是真正的失败
                 if attempt < max_retries - 1:
                     console.print("[yellow]⚠ mkvmerge 执行失败或输出文件仍被占用，2 秒后重试；未完成的 .tmp 将在统一收尾阶段处理。[/yellow]")
