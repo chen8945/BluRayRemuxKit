@@ -21,7 +21,9 @@ RUN pyinstaller \
 
 FROM debian:bookworm-slim AS ffmpeg-source
 
-ARG FFMPEG_VERSION=latest
+# FFmpeg 9 改动了部分 API，MakeMKV 尚未适配，静态链接编译 MakeMKV 会报错，因此默认跟随 8.x 系列最新版。
+# 可传 exact 版本（如 8.1.3）、latest（含 9.x 的全局最新）或 latest-N 跟随 N.x 系列最新（如 latest-8）。
+ARG FFMPEG_VERSION=latest-8
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
@@ -35,10 +37,15 @@ WORKDIR /tmp
 
 RUN set -eux; \
     version="${FFMPEG_VERSION}"; \
-    if [ "${version}" = "latest" ]; then \
-        version="$(curl -fsSL https://www.ffmpeg.org/download.html \
-            | grep -oP 'releases/ffmpeg-\K[0-9]+(\.[0-9]+)*(?=\.tar\.xz)' \
-            | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"; \
+    pattern=''; \
+    case "${version}" in \
+        latest) pattern='[0-9]+(\.[0-9]+)*' ;; \
+        latest-[0-9]) pattern="${version#latest-}(\.[0-9]+)*" ;; \
+    esac; \
+    if [ -n "${pattern}" ]; then \
+        version="$(curl -fsSL https://www.ffmpeg.org/releases/ \
+            | grep -oP "ffmpeg-\K${pattern}(?=\.tar\.xz)" \
+            | sort -t. -k1,1n -k2,2n -k3,3n -u | tail -1)"; \
     fi; \
     test -n "${version}"; \
     curl -fsSLo ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${version}.tar.xz"; \

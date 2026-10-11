@@ -5260,11 +5260,14 @@ class ISOmountManager:
     def _mount_windows(self, iso_path: Path) -> Path:
         """Windows 挂载（通过 PowerShell Mount-DiskImage）"""
 
+        # 转义单引号，防止路径包含单引号时打断 PowerShell 字符串语法
+        escaped_path = str(iso_path.absolute()).replace("'", "''")
+
         # 构建一段极速的微型 PowerShell 脚本
         # 逻辑：检查挂载 -> 如果没挂载则挂载 -> 获取盘符
         ps_script = f"""
         $ErrorActionPreference = 'Stop'
-        $imgPath = '{iso_path.absolute()}'
+        $imgPath = '{escaped_path}'
         
         try {{
             $img = Get-DiskImage -ImagePath $imgPath
@@ -5382,7 +5385,8 @@ class ISOmountManager:
 
     def _unmount_windows(self, iso_path: Path):
         """Windows 卸载（通过 Dismount-DiskImage）"""
-        unmount_cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", f"Dismount-DiskImage -ImagePath '{iso_path.absolute()}' | Out-Null"]
+        escaped_path = str(iso_path.absolute()).replace("'", "''")
+        unmount_cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", f"Dismount-DiskImage -ImagePath '{escaped_path}' | Out-Null"]
 
         try:
             subprocess.run(unmount_cmd, capture_output=True, check=True, creationflags=NO_WINDOW_CREATION_FLAGS)
